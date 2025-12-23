@@ -11,7 +11,12 @@ from typing import Optional, List
 import uuid
 import asyncio
 
-from models import (\n    User, UserCreate, UserUpdate, LoginRequest, OTPVerify, GuestLogin, TokenResponse,\n    ChatRoom, ChatMessage, EngageRoom, WatchRoom, WatchRoomCreate,\n    SingRoom, GameRoom, ChessMove, Friend, FriendRequest, Report, ReportCreate,\n    RoomStatus, FriendStatus, Gender, UserStatus, GameType\n)
+from models import (
+    User, UserCreate, UserUpdate, LoginRequest, OTPVerify, GuestLogin, TokenResponse,
+    ChatRoom, ChatMessage, EngageRoom, WatchRoom, WatchRoomCreate,
+    SingRoom, GameRoom, ChessMove, Friend, FriendRequest, Report, ReportCreate,
+    RoomStatus, FriendStatus, Gender, UserStatus, GameType
+)
 from auth import create_access_token, verify_token, get_current_user, otp_store
 
 ROOT_DIR = Path(__file__).parent
