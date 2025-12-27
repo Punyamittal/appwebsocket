@@ -70,9 +70,12 @@ export default function ChessScreen() {
       console.log('[Chess] Room created:', data);
       setRoomId(data.roomId);
       setRoomCode(data.roomCode || '');
-      setPlayerColor('white');
-      setGameState('waiting');
-      setFen(data.fen);
+      // Don't set playerColor yet - wait for opponent to join
+      setPlayerColor(null);
+      // Show game portal immediately with room code
+      setGameState('active');
+      setFen(data.fen || 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1');
+      setCurrentTurn('white');
     });
 
     socket.on('game_start', (data: any) => {
@@ -144,31 +147,51 @@ export default function ChessScreen() {
 
       await new Promise((resolve, reject) => {
         if (socket.connected) {
+          console.log('[Chess] Socket already connected');
           resolve(null);
           return;
         }
 
         const timeout = setTimeout(() => {
+          console.error('[Chess] Connection timeout after 30 seconds');
           socket.disconnect();
-          reject(new Error('Connection timeout. Make sure the Engage server is running on port 3002 and Redis is running.'));
-        }, 15000); // Increased timeout to 15 seconds
+          reject(new Error('Connection timeout. Make sure:\n\n1. Only ONE Engage server is running on port 3002\n2. Server is accessible at http://localhost:3002\n3. Check browser console for connection errors'));
+        }, 30000); // 30 seconds timeout (matches client config)
 
         const connectHandler = () => {
+          console.log('[Chess] Socket connected successfully');
           clearTimeout(timeout);
           socket.off('connect', connectHandler);
           socket.off('connect_error', errorHandler);
+          socket.off('connected', connectedHandler);
+          socket.off('server_ready', serverReadyHandler);
           resolve(null);
         };
 
+        const connectedHandler = (data: any) => {
+          console.log('[Chess] Server confirmed connection:', data);
+          // Connection is confirmed, but wait for 'connect' event
+        };
+
+        const serverReadyHandler = (data: any) => {
+          console.log('[Chess] Server ready:', data);
+          // Fast acknowledgment - server is ready to accept commands
+          // Still wait for 'connect' event for full connection
+        };
+
         const errorHandler = (error: any) => {
+          console.error('[Chess] Connection error:', error);
           clearTimeout(timeout);
           socket.off('connect', connectHandler);
           socket.off('connect_error', errorHandler);
-          reject(new Error(error.message || 'Failed to connect to game server. Make sure the Engage server is running on port 3002.'));
+          socket.off('connected', connectedHandler);
+          reject(new Error(error.message || 'Failed to connect to game server. Make sure the Engage server is running on port 3002 and was restarted after code changes.'));
         };
 
         socket.once('connect', connectHandler);
         socket.once('connect_error', errorHandler);
+        socket.once('connected', connectedHandler);
+        socket.once('server_ready', serverReadyHandler);
       });
 
       // Set up listeners after connection is established
@@ -264,7 +287,11 @@ export default function ChessScreen() {
     );
   };
 
-  if (gameState === 'active' || gameState === 'finished') {
+  if (gameState === 'active' || gameState === 'finished' || gameState === 'waiting') {
+    // Show game portal immediately when room is created
+    // If we have a roomCode but no opponent has joined yet, we're waiting
+    const isWaitingForOpponent = gameState === 'waiting' || (roomCode && !playerColor);
+    
     return (
       <SafeAreaView style={styles.container}>
         <View style={styles.header}>
@@ -281,6 +308,23 @@ export default function ChessScreen() {
         </View>
 
         <View style={styles.gameContainer}>
+          {/* Room Code Display - Prominent */}
+          {roomCode && (
+            <View style={styles.roomCodeDisplay}>
+              <Text style={styles.roomCodeDisplayLabel}>Room Code</Text>
+              <Text style={styles.roomCodeDisplayValue}>{roomCode.toUpperCase()}</Text>
+              <Text style={styles.roomCodeDisplayHint}>Share this code to invite players</Text>
+            </View>
+          )}
+
+          {/* Waiting Indicator */}
+          {isWaitingForOpponent && (
+            <View style={styles.waitingBanner}>
+              <ActivityIndicator size="small" color="#7C3AED" />
+              <Text style={styles.waitingBannerText}>Waiting for opponent to join...</Text>
+            </View>
+          )}
+
           {/* Chess Board Placeholder */}
           <View style={styles.boardPlaceholder}>
             <Text style={styles.chessIcon}>♔</Text>
@@ -288,14 +332,22 @@ export default function ChessScreen() {
             <Text style={styles.boardSubtext}>
               {gameState === 'finished'
                 ? `Game Over - ${winner === 'draw' ? 'Draw' : `Winner: ${winner}`}`
-                : `Your Color: ${playerColor?.toUpperCase()}`}
+                : isWaitingForOpponent
+                ? 'Waiting for opponent...'
+                : `Your Color: ${playerColor?.toUpperCase() || 'WHITE'}`}
             </Text>
-            <Text style={styles.boardSubtext}>
-              Current Turn: {currentTurn?.toUpperCase()}
-            </Text>
-            <Text style={styles.boardSubtext}>
-              FEN: {fen.substring(0, 30)}...
-            </Text>
+            {!isWaitingForOpponent && (
+              <>
+                <Text style={styles.boardSubtext}>
+                  Current Turn: {currentTurn?.toUpperCase() || 'WHITE'}
+                </Text>
+                {fen && (
+                  <Text style={styles.boardSubtext}>
+                    FEN: {fen.substring(0, 30)}...
+                  </Text>
+                )}
+              </>
+            )}
           </View>
 
           {/* Game Info */}
@@ -636,6 +688,49 @@ const styles = StyleSheet.create({
     color: '#FFFFFF',
     fontSize: 16,
     fontWeight: '600',
+  },
+  roomCodeDisplay: {
+    backgroundColor: '#1A1A1A',
+    padding: 20,
+    borderRadius: 12,
+    alignItems: 'center',
+    marginBottom: 16,
+    borderWidth: 2,
+    borderColor: '#7C3AED',
+  },
+  roomCodeDisplayLabel: {
+    color: 'rgba(255, 255, 255, 0.6)',
+    fontSize: 14,
+    marginBottom: 8,
+    textTransform: 'uppercase',
+    letterSpacing: 1,
+  },
+  roomCodeDisplayValue: {
+    color: '#7C3AED',
+    fontSize: 32,
+    fontWeight: '700',
+    letterSpacing: 6,
+    marginBottom: 8,
+  },
+  roomCodeDisplayHint: {
+    color: 'rgba(255, 255, 255, 0.4)',
+    fontSize: 12,
+    textAlign: 'center',
+  },
+  waitingBanner: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: 'rgba(124, 58, 237, 0.1)',
+    padding: 12,
+    borderRadius: 8,
+    marginBottom: 16,
+    gap: 8,
+  },
+  waitingBannerText: {
+    color: '#7C3AED',
+    fontSize: 14,
+    fontWeight: '500',
   },
   resignButton: {
     backgroundColor: 'rgba(255, 59, 48, 0.2)',

@@ -12,6 +12,9 @@
  * - Clean connection management
  */
 
+// Import polyfills first (for Expo web)
+import '../polyfills';
+
 import { io, Socket, Namespace } from 'socket.io-client';
 import Constants from 'expo-constants';
 import { Platform } from 'react-native';
@@ -66,31 +69,50 @@ class EngageService {
     console.log(`[EngageService] Connecting to ${namespace} at ${url}...`);
 
     const socket = io(url, {
-      transports: ['websocket', 'polling'],
+      // For React Native/Expo web, polling is more reliable initially
+      transports: ['polling', 'websocket'],
+      upgrade: true, // Allow upgrade from polling to WebSocket
       reconnection: true,
       reconnectionDelay: 1000,
       reconnectionDelayMax: 5000,
       reconnectionAttempts: 5,
-      timeout: 20000,
-      connectTimeout: 20000,
+      // Increased timeout to match server (server is 45s, we use 30s for safety)
+      timeout: 30000,
+      connectTimeout: 30000,
       auth: {
         token,
         userId,
       },
-      forceNew: false,
+      forceNew: true, // Force new connection to avoid stale connections
       autoConnect: true,
+      // Additional options for better compatibility
+      rememberUpgrade: true,
     });
 
     socket.on('connect', () => {
       console.log(`[EngageService] ✅ Connected to ${namespace}`);
     });
 
+    socket.on('connect_error', (error) => {
+      console.error(`[EngageService] ❌ Connection error to ${namespace}:`, error.message || error);
+    });
+
     socket.on('disconnect', (reason) => {
       console.log(`[EngageService] ❌ Disconnected from ${namespace}: ${reason}`);
     });
 
-    socket.on('connect_error', (error) => {
-      console.error(`[EngageService] ❌ Connection error to ${namespace}:`, error.message);
+    socket.on('connected', (data) => {
+      console.log(`[EngageService] ✅ Server confirmed connection to ${namespace}:`, data);
+    });
+
+    // New: Server-ready event (fast acknowledgment)
+    socket.on('server_ready', (data) => {
+      console.log(`[EngageService] ✅ Server ready for ${namespace}:`, data);
+    });
+
+    // Add error handler for better debugging
+    socket.on('error', (error) => {
+      console.error(`[EngageService] ❌ Socket error on ${namespace}:`, error);
     });
 
     return socket;

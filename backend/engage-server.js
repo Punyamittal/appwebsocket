@@ -29,6 +29,25 @@ app.use(cors({
   credentials: true,
 }));
 
+// Health check endpoint
+app.get('/', (req, res) => {
+  res.json({ 
+    status: 'ok', 
+    server: 'Engage Socket.IO Server',
+    port: process.env.ENGAGE_PORT || 3002,
+    redis: redisClient.isReady ? 'connected' : 'disconnected'
+  });
+});
+
+// Socket.IO health check
+app.get('/health', (req, res) => {
+  res.json({ 
+    status: 'ok', 
+    namespaces: ['/watch-along', '/play-along', '/sing-along'],
+    redis: redisClient.isReady ? 'connected' : 'disconnected'
+  });
+});
+
 const server = http.createServer(app);
 
 // Optimize server for high concurrency
@@ -94,13 +113,19 @@ redisClient.on('reconnecting', () => {
   console.log('[REDIS] Reconnecting...');
 });
 
+// Connect Redis asynchronously - don't block server startup
 (async () => {
   try {
     await redisClient.connect();
     console.log('[REDIS] ✅ Connected to Redis');
   } catch (error) {
-    console.error('[REDIS] ❌ Failed to connect:', error);
-    process.exit(1);
+    console.error('[REDIS] ❌ Failed to connect:', error.message);
+    console.error('[REDIS] ⚠️  Server will continue but features will be limited');
+    console.error('[REDIS] 💡 To fix:');
+    console.error('[REDIS]    1. Start Docker Desktop');
+    console.error('[REDIS]    2. Run: docker run -d -p 6379:6379 --name redis-skipon redis:latest');
+    console.error('[REDIS]    3. Or install Redis for Windows');
+    console.error('[REDIS] 🔄 Server will auto-reconnect when Redis becomes available.');
   }
 })();
 
@@ -357,16 +382,56 @@ watchAlongNamespace.on('connection', (socket) => {
 const playAlongNamespace = io.of('/play-along');
 
 playAlongNamespace.use((socket, next) => {
-  if (!isAuthenticated(socket)) {
-    console.log(`[PLAY-ALONG] ❌ Unauthenticated connection attempt from ${socket.id}`);
-    return next(new Error('Authentication required'));
+  // ALWAYS allow connection - no auth blocking
+  const hasAuth = socket.handshake.auth?.token || socket.handshake.auth?.userId;
+  if (hasAuth) {
+    socket.data.isAuthenticated = true;
+    console.log(`[PLAY-ALONG] ✅ Authenticated connection from ${socket.id}`);
+  } else {
+    socket.data.isAuthenticated = false;
+    console.log(`[PLAY-ALONG] ⚠️ Connection without auth from ${socket.id} - allowing anyway`);
   }
+  // Always call next() to allow connection
   next();
 });
 
 playAlongNamespace.on('connection', (socket) => {
-  const userId = getUserId(socket);
-  console.log(`[PLAY-ALONG] ✅ User ${userId} connected (socket: ${socket.id})`);
+  const userId = getUserId(socket) || socket.id; // Fallback to socket.id if no userId
+  const transport = socket.conn.transport.name;
+  console.log(`[PLAY-ALONG] ✅ User ${userId} connected (socket: ${socket.id}, transport: ${transport})`);
+  
+  // IMMEDIATE acknowledgment - don't wait for anything
+  // Check Redis status safely
+  let redisStatus = false;
+  try {
+    redisStatus = redisClient && typeof redisClient.isReady === 'function' 
+      ? redisClient.isReady() 
+      : (redisClient?.isReady === true);
+  } catch (e) {
+    redisStatus = false;
+  }
+  
+  socket.emit('server_ready', { 
+    socketId: socket.id, 
+    userId,
+    redisReady: redisStatus,
+    timestamp: Date.now()
+  });
+  
+  // Also emit legacy 'connected' event for compatibility
+  socket.emit('connected', { socketId: socket.id, userId });
+  
+  // Log connection details for debugging
+  console.log(`[PLAY-ALONG] 📊 Connection details:`, {
+    socketId: socket.id,
+    userId,
+    transport,
+    redisReady: redisStatus,
+    handshake: {
+      address: socket.handshake.address,
+      headers: socket.handshake.headers['user-agent']
+    }
+  });
 
   // Create chess room
   socket.on('create_chess_room', async () => {
@@ -802,11 +867,12 @@ io.engine.on('connection', (socket) => {
   });
 });
 
-server.listen(PORT, () => {
+server.listen(PORT, '0.0.0.0', () => {
   console.log(`\n${'='.repeat(50)}`);
   console.log(`🚀 ENGAGE Socket.IO Server Running`);
   console.log(`${'='.repeat(50)}`);
   console.log(`Port: ${PORT}`);
+  console.log(`Host: 0.0.0.0 (all interfaces)`);
   console.log(`Max Connections: ${server.maxConnections}`);
   console.log(`Optimized for: 1000+ concurrent users`);
   console.log(`Namespaces:`);
@@ -814,6 +880,8 @@ server.listen(PORT, () => {
   console.log(`  - /play-along (Real-time Chess)`);
   console.log(`  - /sing-along (Phase 1: YouTube sync)`);
   console.log(`Redis: ${process.env.REDIS_HOST || 'localhost'}:${process.env.REDIS_PORT || 6379}`);
+  console.log(`Redis Status: ${redisClient.isReady ? '✅ Connected' : '⚠️  Disconnected (will reconnect)'}`);
+  console.log(`Health Check: http://localhost:${PORT}/health`);
   console.log(`${'='.repeat(50)}\n`);
 });
 
