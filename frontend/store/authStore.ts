@@ -267,13 +267,24 @@ export const useAuthStore = create<AuthState>((set, get) => ({
         const user = firebaseUserToUser(firebaseUser);
         await get().setToken(idToken);
         await get().setUser(user);
+        console.log('✅ Apple sign-in successful');
       } else {
         // Native: Use Expo AuthSession or native Apple Sign In
         throw new Error('Native Apple sign-in not yet implemented. Please use web for now.');
       }
     } catch (error: any) {
-      console.error('Apple sign-in error:', error);
-      throw new Error(error.message || 'Apple sign-in failed');
+      console.error('❌ Apple sign-in error:', error);
+      
+      // Provide helpful error messages
+      if (error.code === 'auth/operation-not-allowed') {
+        throw new Error('Apple sign-in is not enabled in Firebase. Go to Firebase Console → Authentication → Sign-in method → Apple → Enable → Save. Wait 2-3 minutes, then try again. See APPLE_SIGNIN_VERIFY.md for verification steps.');
+      } else if (error.code === 'auth/popup-closed-by-user') {
+        throw new Error('Sign-in cancelled');
+      } else if (error.code === 'auth/invalid-client') {
+        throw new Error('Apple sign-in configuration error. Please check Firebase Console settings.');
+      } else {
+        throw new Error(error.message || 'Apple sign-in failed');
+      }
     }
   },
 
