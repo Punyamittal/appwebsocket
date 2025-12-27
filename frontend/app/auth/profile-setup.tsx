@@ -11,6 +11,7 @@ import {
   ActivityIndicator,
   ScrollView,
   useWindowDimensions,
+  Image,
 } from 'react-native';
 import { useRouter } from 'expo-router';
 import { useAuthStore } from '../../store/authStore';
@@ -18,12 +19,26 @@ import { LinearGradient } from 'expo-linear-gradient';
 import { Colors, Typography, Spacing, BorderRadius, Shadows } from '../../constants/theme';
 import { Ionicons } from '@expo/vector-icons';
 
+// Import avatar images
+const avatarImages = {
+  i1: require('../../assets/images/i1.png'),
+  i2: require('../../assets/images/i2.png'),
+  i3: require('../../assets/images/i3.png'),
+  i4: require('../../assets/images/i4.png'),
+  i5: require('../../assets/images/i5.png'),
+  i6: require('../../assets/images/i6.png'),
+  i7: require('../../assets/images/i7.png'),
+};
+
+const avatarOptions = ['i1', 'i2', 'i3', 'i4', 'i5', 'i6', 'i7'];
+
 export default function ProfileSetupScreen() {
   const router = useRouter();
   const { user, updateProfile } = useAuthStore();
   const [name, setName] = useState(user?.name || '');
   const [city, setCity] = useState(user?.city || '');
   const [gender, setGender] = useState(user?.gender || 'other');
+  const [selectedAvatar, setSelectedAvatar] = useState<string>(user?.avatar_base64 || 'i1');
   const [loading, setLoading] = useState(false);
   const [showGenderPicker, setShowGenderPicker] = useState(false);
   const { width } = useWindowDimensions();
@@ -67,7 +82,12 @@ export default function ProfileSetupScreen() {
 
     setLoading(true);
     try {
-      await updateProfile({ name: name.trim(), city: city.trim(), gender: gender as any });
+      await updateProfile({ 
+        name: name.trim(), 
+        city: city.trim(), 
+        gender: gender as any,
+        avatar_base64: selectedAvatar 
+      });
       router.replace('/home/chat-on');
     } catch (error: any) {
       Alert.alert('Error', error.message || 'Failed to save profile');
@@ -141,6 +161,34 @@ export default function ProfileSetupScreen() {
                   />
                 </View>
 
+                {/* Avatar Selection */}
+                <View style={styles.avatarSection}>
+                  <Text style={styles.avatarSectionTitle}>Choose Your Avatar</Text>
+                  <View style={styles.avatarGrid}>
+                    {avatarOptions.map((avatarKey) => (
+                      <Pressable
+                        key={avatarKey}
+                        style={[
+                          styles.avatarOption,
+                          selectedAvatar === avatarKey && styles.avatarOptionSelected,
+                        ]}
+                        onPress={() => setSelectedAvatar(avatarKey)}
+                      >
+                        <Image
+                          source={avatarImages[avatarKey as keyof typeof avatarImages]}
+                          style={styles.avatarImage}
+                          resizeMode="cover"
+                        />
+                        {selectedAvatar === avatarKey && (
+                          <View style={styles.avatarCheckmark}>
+                            <Ionicons name="checkmark" size={20} color="#FFFFFF" />
+                          </View>
+                        )}
+                      </Pressable>
+                    ))}
+                  </View>
+                </View>
+
                 {/* Gender Picker */}
                 <View style={styles.pickerContainer}>
                   <Pressable
@@ -159,40 +207,43 @@ export default function ProfileSetupScreen() {
                   </Pressable>
 
                   {showGenderPicker && (
-                    <View style={styles.dropdownContainer}>
-                      {genderOptions.map((option) => (
-                        <Pressable
-                          key={option.value}
-                          style={[
-                            styles.dropdownOption,
-                            gender === option.value && styles.dropdownOptionSelected,
-                          ]}
-                          onPress={() => handleGenderSelect(option.value)}
-                        >
-                          <Text
-                            style={[
-                              styles.dropdownOptionText,
-                              gender === option.value && styles.dropdownOptionTextSelected,
+                    <>
+                      <Pressable
+                        style={styles.dropdownBackdrop}
+                        onPress={closeDropdown}
+                      />
+                      <View style={styles.dropdownContainer}>
+                        {genderOptions.map((option) => (
+                          <Pressable
+                            key={option.value}
+                            style={({ pressed }) => [
+                              styles.dropdownOption,
+                              gender === option.value && styles.dropdownOptionSelected,
+                              pressed && styles.dropdownOptionPressed,
                             ]}
+                            onPress={() => {
+                              handleGenderSelect(option.value);
+                            }}
+                            android_ripple={{ color: 'rgba(255, 255, 255, 0.1)' }}
                           >
-                            {option.label}
-                          </Text>
-                          {gender === option.value && (
-                            <Ionicons name="checkmark" size={20} color="#4A90E2" />
-                          )}
-                        </Pressable>
-                      ))}
-                    </View>
+                            <Text
+                              style={[
+                                styles.dropdownOptionText,
+                                gender === option.value && styles.dropdownOptionTextSelected,
+                              ]}
+                            >
+                              {option.label}
+                            </Text>
+                            {gender === option.value && (
+                              <Ionicons name="checkmark" size={20} color="#4A90E2" />
+                            )}
+                          </Pressable>
+                        ))}
+                      </View>
+                    </>
                   )}
                 </View>
 
-                {/* Profile Picture Note (Optional) */}
-                <View style={styles.noteContainer}>
-                  <Ionicons name="information-circle-outline" size={16} color="rgba(255, 255, 255, 0.5)" />
-                  <Text style={styles.noteText}>
-                    Profile picture can be added later from your profile settings
-                  </Text>
-                </View>
 
                 {/* Continue Button */}
                 <Pressable
@@ -306,6 +357,7 @@ const styles = StyleSheet.create({
   pickerContainer: {
     marginBottom: Spacing.md,
     position: 'relative',
+    zIndex: 1000,
   },
   pickerButton: {
     backgroundColor: 'rgba(255, 255, 255, 0.08)',
@@ -334,25 +386,25 @@ const styles = StyleSheet.create({
     top: '100%',
     left: 0,
     right: 0,
-    backgroundColor: '#1A1A1A',
+    backgroundColor: '#1E293B',
     borderRadius: 16,
     marginTop: 4,
     borderWidth: 1,
-    borderColor: 'rgba(255, 255, 255, 0.1)',
+    borderColor: 'rgba(255, 255, 255, 0.15)',
     overflow: 'hidden',
-    zIndex: 10,
+    zIndex: 1000,
     ...Platform.select({
       ios: {
         shadowColor: '#000',
         shadowOffset: { width: 0, height: 4 },
-        shadowOpacity: 0.3,
+        shadowOpacity: 0.5,
         shadowRadius: 8,
       },
       android: {
-        elevation: 8,
+        elevation: 10,
       },
       web: {
-        boxShadow: '0 4px 12px rgba(0, 0, 0, 0.3)',
+        boxShadow: '0 4px 12px rgba(0, 0, 0, 0.5)',
       },
     }),
   },
@@ -361,12 +413,36 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'space-between',
     paddingHorizontal: Spacing.md,
-    paddingVertical: Spacing.md,
+    paddingVertical: Spacing.md + 4,
     borderBottomWidth: 0.5,
-    borderBottomColor: 'rgba(255, 255, 255, 0.05)',
+    borderBottomColor: 'rgba(255, 255, 255, 0.1)',
+    minHeight: 48,
   },
   dropdownOptionSelected: {
-    backgroundColor: 'rgba(74, 144, 226, 0.1)',
+    backgroundColor: 'rgba(74, 144, 226, 0.15)',
+  },
+  dropdownOptionPressed: {
+    backgroundColor: 'rgba(255, 255, 255, 0.1)',
+  },
+  dropdownBackdrop: {
+    ...Platform.select({
+      web: {
+        position: 'fixed',
+        top: 0,
+        left: 0,
+        right: 0,
+        bottom: 0,
+        zIndex: 999,
+      },
+      default: {
+        position: 'absolute',
+        top: -10000,
+        left: -10000,
+        right: -10000,
+        bottom: -10000,
+        zIndex: 999,
+      },
+    }),
   },
   dropdownOptionText: {
     fontSize: 16,
@@ -376,20 +452,49 @@ const styles = StyleSheet.create({
     color: '#FFFFFF',
     fontWeight: '600',
   },
-  noteContainer: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    backgroundColor: 'rgba(74, 144, 226, 0.1)',
-    padding: Spacing.md,
-    borderRadius: 12,
-    marginBottom: Spacing.lg,
-    gap: Spacing.sm,
+  avatarSection: {
+    marginBottom: Spacing.md,
   },
-  noteText: {
-    flex: 1,
-    fontSize: 13,
-    color: 'rgba(255, 255, 255, 0.7)',
-    lineHeight: 18,
+  avatarSectionTitle: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: 'rgba(255, 255, 255, 0.8)',
+    marginBottom: Spacing.md,
+    marginLeft: 4,
+  },
+  avatarGrid: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    justifyContent: 'space-between',
+  },
+  avatarOption: {
+    width: 70,
+    height: 70,
+    borderRadius: 35,
+    overflow: 'hidden',
+    borderWidth: 2,
+    borderColor: 'rgba(255, 255, 255, 0.2)',
+    backgroundColor: 'rgba(255, 255, 255, 0.05)',
+    position: 'relative',
+    marginBottom: Spacing.sm,
+  },
+  avatarOptionSelected: {
+    borderColor: '#4A90E2',
+    borderWidth: 3,
+  },
+  avatarImage: {
+    width: '100%',
+    height: '100%',
+  },
+  avatarCheckmark: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    backgroundColor: 'rgba(74, 144, 226, 0.7)',
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   primaryButton: {
     borderRadius: 16,

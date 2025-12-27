@@ -191,49 +191,58 @@ export default function GuestLoginScreen() {
 
                     {/* Simple Dropdown - Positioned below button */}
                     {showGenderPicker && (
-                      <View style={styles.dropdownContainer}>
-                        <View style={styles.dropdownModal}>
-                          <LinearGradient
-                            colors={['rgba(15, 23, 42, 0.98)', 'rgba(30, 41, 59, 0.98)']}
-                            start={{ x: 0, y: 0 }}
-                            end={{ x: 0, y: 1 }}
-                            style={styles.dropdownGradient}
-                          >
-                            <View style={styles.dropdownContent}>
-                              {genderOptions.map((option, index) => (
-                                <Pressable
-                                  key={option.value}
-                                  style={({ pressed }) => [
-                                    styles.dropdownItem,
-                                    gender === option.value && styles.dropdownItemSelected,
-                                    pressed && styles.dropdownItemPressed,
-                                    index === genderOptions.length - 1 && styles.dropdownItemLast,
-                                  ]}
-                                  onPress={() => handleGenderSelect(option.value)}
-                                >
-                                  <Text
-                                    style={[
-                                      styles.dropdownItemText,
-                                      gender === option.value && styles.dropdownItemTextSelected,
+                      <>
+                        <Pressable
+                          style={styles.dropdownBackdrop}
+                          onPress={closeDropdown}
+                        />
+                        <View style={styles.dropdownContainer}>
+                          <View style={styles.dropdownModal}>
+                            <LinearGradient
+                              colors={['#1E293B', '#0F172A']}
+                              start={{ x: 0, y: 0 }}
+                              end={{ x: 0, y: 1 }}
+                              style={styles.dropdownGradient}
+                            >
+                              <View style={styles.dropdownContent}>
+                                {genderOptions.map((option, index) => (
+                                  <Pressable
+                                    key={option.value}
+                                    style={({ pressed }) => [
+                                      styles.dropdownItem,
+                                      gender === option.value && styles.dropdownItemSelected,
+                                      pressed && styles.dropdownItemPressed,
+                                      index === genderOptions.length - 1 && styles.dropdownItemLast,
                                     ]}
+                                    onPress={() => {
+                                      handleGenderSelect(option.value);
+                                    }}
+                                    android_ripple={{ color: 'rgba(255, 255, 255, 0.1)' }}
                                   >
-                                    {option.label}
-                                  </Text>
-                                  {gender === option.value && (
-                                    <View style={styles.checkmarkContainer}>
-                                      <Ionicons 
-                                        name="checkmark-circle" 
-                                        size={20} 
-                                        color="rgba(37, 99, 235, 0.9)" 
-                                      />
-                                    </View>
-                                  )}
-                                </Pressable>
-                              ))}
-                            </View>
-                          </LinearGradient>
+                                    <Text
+                                      style={[
+                                        styles.dropdownItemText,
+                                        gender === option.value && styles.dropdownItemTextSelected,
+                                      ]}
+                                    >
+                                      {option.label}
+                                    </Text>
+                                    {gender === option.value && (
+                                      <View style={styles.checkmarkContainer}>
+                                        <Ionicons 
+                                          name="checkmark-circle" 
+                                          size={20} 
+                                          color="rgba(37, 99, 235, 0.9)" 
+                                        />
+                                      </View>
+                                    )}
+                                  </Pressable>
+                                ))}
+                              </View>
+                            </LinearGradient>
+                          </View>
                         </View>
-                      </View>
+                      </>
                     )}
                   </View>
 
@@ -378,14 +387,14 @@ const styles = StyleSheet.create({
   pickerContainer: {
     marginBottom: Spacing.lg,
     position: 'relative',
-    zIndex: 1,
+    zIndex: 1000,
   },
   dropdownContainer: {
     position: 'absolute',
     top: '100%',
     left: 0,
     right: 0,
-    zIndex: 10,
+    zIndex: 1000,
     marginTop: Spacing.xs,
   },
   pickerButton: {
@@ -440,8 +449,9 @@ const styles = StyleSheet.create({
   dropdownGradient: {
     borderRadius: 16,
     borderWidth: 1,
-    borderColor: 'rgba(255, 255, 255, 0.08)', // Subtle border matching theme
+    borderColor: 'rgba(255, 255, 255, 0.15)', // More visible border
     overflow: 'hidden',
+    backgroundColor: '#1E293B', // Solid fallback background
   },
   dropdownContent: {
     paddingVertical: Spacing.xs,
@@ -451,7 +461,7 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
-    paddingVertical: Spacing.md + 2, // Generous vertical padding
+    paddingVertical: Spacing.md + 4, // Generous vertical padding
     paddingHorizontal: Spacing.md + 4, // Comfortable horizontal padding
     borderRadius: 12,
     marginHorizontal: Spacing.xs,
@@ -491,6 +501,26 @@ const styles = StyleSheet.create({
     marginLeft: Spacing.sm,
     alignItems: 'center',
     justifyContent: 'center',
+  },
+  dropdownBackdrop: {
+    ...Platform.select({
+      web: {
+        position: 'fixed',
+        top: 0,
+        left: 0,
+        right: 0,
+        bottom: 0,
+        zIndex: 999,
+      },
+      default: {
+        position: 'absolute',
+        top: -10000,
+        left: -10000,
+        right: -10000,
+        bottom: -10000,
+        zIndex: 999,
+      },
+    }),
   },
   button: {
     borderRadius: 28, // Pill shape - same as Welcome Page

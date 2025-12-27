@@ -55,15 +55,21 @@ export default function ChessScreen() {
   }, []);
 
   // Setup Socket.IO listeners
-  useEffect(() => {
-    if (!token || !user || !socketRef.current) return;
+  const setupSocketListeners = (socket: any) => {
+    if (!socket || !user) return;
 
-    const socket = socketRef.current;
+    // Remove existing listeners to avoid duplicates
+    socket.off('room_created');
+    socket.off('game_start');
+    socket.off('move_update');
+    socket.off('game_over');
+    socket.off('opponent_left');
+    socket.off('error');
 
     socket.on('room_created', (data: any) => {
       console.log('[Chess] Room created:', data);
       setRoomId(data.roomId);
-      setRoomCode(data.roomId.split('_')[1]?.substring(0, 6) || '');
+      setRoomCode(data.roomCode || '');
       setPlayerColor('white');
       setGameState('waiting');
       setFen(data.fen);
@@ -110,16 +116,21 @@ export default function ChessScreen() {
     socket.on('error', (error: { message: string }) => {
       Alert.alert('Error', error.message);
     });
+  };
 
+  // Cleanup listeners on unmount
+  useEffect(() => {
     return () => {
-      socket.off('room_created');
-      socket.off('game_start');
-      socket.off('move_update');
-      socket.off('game_over');
-      socket.off('opponent_left');
-      socket.off('error');
+      if (socketRef.current) {
+        socketRef.current.off('room_created');
+        socketRef.current.off('game_start');
+        socketRef.current.off('move_update');
+        socketRef.current.off('game_over');
+        socketRef.current.off('opponent_left');
+        socketRef.current.off('error');
+      }
     };
-  }, [token, user, roomId]);
+  }, []);
 
   const handleCreateGame = async () => {
     if (!token || !user) {
@@ -138,29 +149,44 @@ export default function ChessScreen() {
         }
 
         const timeout = setTimeout(() => {
-          reject(new Error('Connection timeout'));
-        }, 10000);
+          socket.disconnect();
+          reject(new Error('Connection timeout. Make sure the Engage server is running on port 3002 and Redis is running.'));
+        }, 15000); // Increased timeout to 15 seconds
 
-        socket.once('connect', () => {
+        const connectHandler = () => {
           clearTimeout(timeout);
+          socket.off('connect', connectHandler);
+          socket.off('connect_error', errorHandler);
           resolve(null);
-        });
+        };
 
-        socket.once('connect_error', (error) => {
+        const errorHandler = (error: any) => {
           clearTimeout(timeout);
-          reject(error);
-        });
+          socket.off('connect', connectHandler);
+          socket.off('connect_error', errorHandler);
+          reject(new Error(error.message || 'Failed to connect to game server. Make sure the Engage server is running on port 3002.'));
+        };
+
+        socket.once('connect', connectHandler);
+        socket.once('connect_error', errorHandler);
       });
+
+      // Set up listeners after connection is established
+      setupSocketListeners(socket);
 
       socket.emit('create_chess_room');
     } catch (error: any) {
-      Alert.alert('Error', error.message || 'Failed to create game');
+      console.error('[Chess] Create game error:', error);
+      Alert.alert(
+        'Connection Error', 
+        error.message || 'Failed to create game. Make sure:\n\n1. Engage server is running (port 3002)\n2. Redis is running\n3. Check your network connection'
+      );
     }
   };
 
   const handleJoinGame = async () => {
-    if (!roomCode || roomCode.trim().length < 6) {
-      Alert.alert('Error', 'Please enter a valid room code (6+ characters)');
+    if (!roomCode || roomCode.trim().length !== 6) {
+      Alert.alert('Error', 'Please enter a valid 6-digit room code');
       return;
     }
 
@@ -193,6 +219,9 @@ export default function ChessScreen() {
           reject(error);
         });
       });
+
+      // Set up listeners after connection is established
+      setupSocketListeners(socket);
 
       // Send roomCode to server - server will look it up
       socket.emit('join_chess_room', { roomCode: roomCode.trim().toUpperCase() });
@@ -366,11 +395,16 @@ export default function ChessScreen() {
 
           <TextInput
             style={styles.input}
-            placeholder="Enter room code (6 digits)"
+            placeholder="Enter 6-digit room code"
             placeholderTextColor="rgba(255, 255, 255, 0.4)"
             value={roomCode || ''}
-            onChangeText={setRoomCode}
+            onChangeText={(text) => {
+              // Only allow numeric input
+              const numericText = text.replace(/[^0-9]/g, '');
+              setRoomCode(numericText);
+            }}
             maxLength={6}
+            keyboardType="numeric"
           />
 
           <TouchableOpacity style={styles.secondaryButton} onPress={handleJoinGame}>

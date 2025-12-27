@@ -31,8 +31,8 @@ const firebaseConfig = {
   storageBucket: getConfigValue('EXPO_PUBLIC_FIREBASE_STORAGE_BUCKET') || 'gingr-13c0c.firebasestorage.app',
   messagingSenderId: getConfigValue('EXPO_PUBLIC_FIREBASE_MESSAGING_SENDER_ID') || '471244536424',
   appId: getConfigValue('EXPO_PUBLIC_FIREBASE_APP_ID') || '1:471244536424:web:028901627db4e7932b99dd',
-  // Database URL will be auto-detected, but can be explicitly set if needed
-  // databaseURL: getConfigValue('EXPO_PUBLIC_FIREBASE_DATABASE_URL') || 'https://gingr-13c0c-default-rtdb.firebaseio.com',
+  // Database URL for Realtime Database (required for Skip On chat)
+  databaseURL: getConfigValue('EXPO_PUBLIC_FIREBASE_DATABASE_URL') || 'https://gingr-13c0c-default-rtdb.firebaseio.com/',
 };
 
 // Debug: Log what we're reading (only in development)

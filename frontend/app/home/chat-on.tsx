@@ -17,6 +17,7 @@ import {
   Platform,
   ActivityIndicator,
   Alert,
+  Image,
 } from 'react-native';
 import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
@@ -26,6 +27,24 @@ import TopNavigation from '../../components/TopNavigation';
 // Skip On Service (REST + Firebase, no Socket.IO)
 import skipOnService, { ChatMessage as SkipOnMessage } from '../../services/skipOnService.new';
 import skipOnRESTService from '../../services/skipOnRESTService';
+
+// Import avatar images
+const avatarImages = {
+  i1: require('../../assets/images/i1.png'),
+  i2: require('../../assets/images/i2.png'),
+  i3: require('../../assets/images/i3.png'),
+  i4: require('../../assets/images/i4.png'),
+  i5: require('../../assets/images/i5.png'),
+  i6: require('../../assets/images/i6.png'),
+  i7: require('../../assets/images/i7.png'),
+};
+
+const getAvatarImage = (avatarKey?: string) => {
+  if (avatarKey && avatarKey in avatarImages) {
+    return avatarImages[avatarKey as keyof typeof avatarImages];
+  }
+  return avatarImages.i1;
+};
 
 type ChatState = 'idle' | 'searching' | 'chatting' | 'error';
 
@@ -181,23 +200,52 @@ export default function ChatOnScreen() {
   /**
    * Render message bubble
    */
-  const renderMessage = ({ item }: { item: ChatMessage }) => (
-    <View
-      style={[
-        styles.messageBubble,
-        item.is_self ? styles.myMessage : styles.theirMessage,
-      ]}
-    >
-      <Text
+  const renderMessage = ({ item }: { item: ChatMessage }) => {
+    const userAvatar = user?.avatar_base64 || 'i1';
+    
+    return (
+      <View
         style={[
-          styles.messageText,
-          item.is_self ? styles.myMessageText : styles.theirMessageText,
+          styles.messageContainer,
+          item.is_self ? styles.myMessageContainer : styles.theirMessageContainer,
         ]}
       >
-        {item.message}
-      </Text>
-    </View>
-  );
+        {!item.is_self && (
+          <View style={styles.messageAvatarContainer}>
+            <Image
+              source={getAvatarImage('i1')} // Partner avatar - using default for now
+              style={styles.messageAvatarImage}
+              resizeMode="cover"
+            />
+          </View>
+        )}
+        <View
+          style={[
+            styles.messageBubble,
+            item.is_self ? styles.myMessage : styles.theirMessage,
+          ]}
+        >
+          <Text
+            style={[
+              styles.messageText,
+              item.is_self ? styles.myMessageText : styles.theirMessageText,
+            ]}
+          >
+            {item.message}
+          </Text>
+        </View>
+        {item.is_self && (
+          <View style={styles.messageAvatarContainer}>
+            <Image
+              source={getAvatarImage(userAvatar)}
+              style={styles.messageAvatarImage}
+              resizeMode="cover"
+            />
+          </View>
+        )}
+      </View>
+    );
+  };
 
   // ====================================
   // RENDER STATES
@@ -212,13 +260,11 @@ export default function ChatOnScreen() {
           <View style={styles.startContainer}>
             <View style={styles.profilePictureContainer}>
               <View style={styles.profilePicture}>
-                {user?.name ? (
-                  <Text style={styles.profileInitial}>
-                    {user.name.charAt(0).toUpperCase()}
-                  </Text>
-                ) : (
-                  <Ionicons name="person" size={48} color="#4A90E2" />
-                )}
+                <Image
+                  source={getAvatarImage(user?.avatar_base64 || 'i1')}
+                  style={styles.profilePictureImage}
+                  resizeMode="cover"
+                />
               </View>
             </View>
 
@@ -341,6 +387,7 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     borderWidth: 2,
     borderColor: 'rgba(74, 144, 226, 0.3)',
+    overflow: 'hidden',
     ...Platform.select({
       ios: {
         shadowColor: '#4A90E2',
@@ -356,10 +403,10 @@ const styles = StyleSheet.create({
       },
     }),
   },
-  profileInitial: {
-    fontSize: 48,
-    fontWeight: '700',
-    color: '#4A90E2',
+  profilePictureImage: {
+    width: '100%',
+    height: '100%',
+    borderRadius: 60,
   },
   startButton: {
     backgroundColor: '#4A90E2',
@@ -460,18 +507,42 @@ const styles = StyleSheet.create({
     padding: 16,
     paddingBottom: 16,
   },
+  messageContainer: {
+    flexDirection: 'row',
+    alignItems: 'flex-end',
+    marginBottom: 12,
+    maxWidth: '85%',
+  },
+  myMessageContainer: {
+    alignSelf: 'flex-end',
+    justifyContent: 'flex-end',
+  },
+  theirMessageContainer: {
+    alignSelf: 'flex-start',
+    justifyContent: 'flex-start',
+  },
+  messageAvatarContainer: {
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    marginHorizontal: 8,
+    borderWidth: 1.5,
+    borderColor: 'rgba(255, 255, 255, 0.1)',
+    overflow: 'hidden',
+  },
+  messageAvatarImage: {
+    width: '100%',
+    height: '100%',
+  },
   messageBubble: {
-    maxWidth: '75%',
+    maxWidth: '100%',
     padding: 14,
     borderRadius: 20,
-    marginBottom: 12,
   },
   myMessage: {
-    alignSelf: 'flex-end',
     backgroundColor: '#4A90E2',
   },
   theirMessage: {
-    alignSelf: 'flex-start',
     backgroundColor: '#1A1A1A',
     borderWidth: 0.5,
     borderColor: 'rgba(255, 255, 255, 0.1)',

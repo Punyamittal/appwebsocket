@@ -30,8 +30,19 @@ const getBackendUrl = (): string => {
     }
     return url;
   }
+  
+  // For mobile devices, try to detect the correct IP
   // Default to localhost:3002 for Engage server
-  return 'http://localhost:3002';
+  if (Platform.OS === 'android') {
+    // Android emulator uses 10.0.2.2 to access host machine
+    return 'http://10.0.2.2:3002';
+  } else if (Platform.OS === 'ios') {
+    // iOS simulator can use localhost
+    return 'http://localhost:3002';
+  } else {
+    // Web
+    return 'http://localhost:3002';
+  }
 };
 
 class EngageService {
@@ -52,7 +63,7 @@ class EngageService {
    */
   private connectToNamespace(namespace: string, token: string, userId: string): Namespace {
     const url = `${this.backendUrl}${namespace}`;
-    console.log(`[EngageService] Connecting to ${namespace}...`);
+    console.log(`[EngageService] Connecting to ${namespace} at ${url}...`);
 
     const socket = io(url, {
       transports: ['websocket', 'polling'],
@@ -61,10 +72,13 @@ class EngageService {
       reconnectionDelayMax: 5000,
       reconnectionAttempts: 5,
       timeout: 20000,
+      connectTimeout: 20000,
       auth: {
         token,
         userId,
       },
+      forceNew: false,
+      autoConnect: true,
     });
 
     socket.on('connect', () => {

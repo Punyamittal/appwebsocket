@@ -1,17 +1,32 @@
-import React, { useEffect } from 'react';
-import { View, Text, StyleSheet, ScrollView, TouchableOpacity, Alert, Platform, useWindowDimensions } from 'react-native';
+import React, { useState } from 'react';
+import { View, Text, StyleSheet, ScrollView, TouchableOpacity, Alert, Platform, useWindowDimensions, Image, Modal, Pressable } from 'react-native';
 import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useRouter, Redirect } from 'expo-router';
 import { useAuthStore } from '../../store/authStore';
 import { Ionicons } from '@expo/vector-icons';
 import TopNavigation from '../../components/TopNavigation';
 
+// Import avatar images
+const avatarImages = {
+  i1: require('../../assets/images/i1.png'),
+  i2: require('../../assets/images/i2.png'),
+  i3: require('../../assets/images/i3.png'),
+  i4: require('../../assets/images/i4.png'),
+  i5: require('../../assets/images/i5.png'),
+  i6: require('../../assets/images/i6.png'),
+  i7: require('../../assets/images/i7.png'),
+};
+
+const avatarOptions = ['i1', 'i2', 'i3', 'i4', 'i5', 'i6', 'i7'];
+
 export default function ProfileScreen() {
   const router = useRouter();
-  const { user, logout, isAuthenticated } = useAuthStore();
+  const { user, logout, isAuthenticated, updateProfile } = useAuthStore();
   const insets = useSafeAreaInsets();
   const bottomPadding = insets.bottom + 24;
   const isGuest = !user || user.is_guest;
+  const [showAvatarPicker, setShowAvatarPicker] = useState(false);
+  const selectedAvatar = user?.avatar_base64 || 'i1';
   
   // If not authenticated, show redirect immediately (don't use useEffect for initial redirect)
   if (!isAuthenticated) {
@@ -56,6 +71,22 @@ export default function ProfileScreen() {
     router.push('/welcome');
   };
 
+  const handleAvatarSelect = async (avatarKey: string) => {
+    try {
+      await updateProfile({ avatar_base64: avatarKey });
+      setShowAvatarPicker(false);
+    } catch (error: any) {
+      Alert.alert('Error', error.message || 'Failed to update avatar');
+    }
+  };
+
+  const getAvatarImage = (avatarKey: string) => {
+    if (avatarKey && avatarKey in avatarImages) {
+      return avatarImages[avatarKey as keyof typeof avatarImages];
+    }
+    return avatarImages.i1;
+  };
+
   return (
     <View style={styles.container}>
       <TopNavigation />
@@ -66,11 +97,24 @@ export default function ProfileScreen() {
       >
         {/* Premium Header */}
         <View style={styles.header}>
-          <View style={styles.avatarContainer}>
+          <Pressable 
+            style={styles.avatarContainer}
+            onPress={() => !isGuest && setShowAvatarPicker(true)}
+            disabled={isGuest}
+          >
             <View style={styles.avatarCircle}>
-              <Ionicons name="person" size={48} color="#4A90E2" />
+              <Image
+                source={getAvatarImage(selectedAvatar)}
+                style={styles.avatarImage}
+                resizeMode="cover"
+              />
+              {!isGuest && (
+                <View style={styles.avatarEditBadge}>
+                  <Ionicons name="camera" size={16} color="#FFFFFF" />
+                </View>
+              )}
             </View>
-          </View>
+          </Pressable>
           <Text style={styles.name}>{user?.name || 'Guest User'}</Text>
           <Text style={styles.email}>{user?.email || 'Guest User'}</Text>
         </View>
@@ -166,6 +210,51 @@ export default function ProfileScreen() {
           <Text style={styles.footerSubtext}>Made with ❤️ for connecting people</Text>
         </View>
       </ScrollView>
+
+      {/* Avatar Picker Modal */}
+      <Modal
+        visible={showAvatarPicker}
+        transparent={true}
+        animationType="slide"
+        onRequestClose={() => setShowAvatarPicker(false)}
+      >
+        <Pressable 
+          style={styles.modalBackdrop}
+          onPress={() => setShowAvatarPicker(false)}
+        >
+          <Pressable style={styles.modalContent} onPress={(e) => e.stopPropagation()}>
+            <View style={styles.modalHeader}>
+              <Text style={styles.modalTitle}>Choose Your Avatar</Text>
+              <Pressable onPress={() => setShowAvatarPicker(false)}>
+                <Ionicons name="close" size={24} color="#FFFFFF" />
+              </Pressable>
+            </View>
+            <View style={styles.modalAvatarGrid}>
+              {avatarOptions.map((avatarKey) => (
+                <Pressable
+                  key={avatarKey}
+                  style={[
+                    styles.modalAvatarOption,
+                    selectedAvatar === avatarKey && styles.modalAvatarOptionSelected,
+                  ]}
+                  onPress={() => handleAvatarSelect(avatarKey)}
+                >
+                  <Image
+                    source={avatarImages[avatarKey as keyof typeof avatarImages]}
+                    style={styles.modalAvatarImage}
+                    resizeMode="cover"
+                  />
+                  {selectedAvatar === avatarKey && (
+                    <View style={styles.modalAvatarCheckmark}>
+                      <Ionicons name="checkmark" size={24} color="#FFFFFF" />
+                    </View>
+                  )}
+                </Pressable>
+              ))}
+            </View>
+          </Pressable>
+        </Pressable>
+      </Modal>
     </View>
   );
 }
@@ -196,6 +285,25 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     borderWidth: 2,
     borderColor: 'rgba(74, 144, 226, 0.3)',
+    overflow: 'hidden',
+    position: 'relative',
+  },
+  avatarImage: {
+    width: '100%',
+    height: '100%',
+  },
+  avatarEditBadge: {
+    position: 'absolute',
+    bottom: 0,
+    right: 0,
+    backgroundColor: '#4A90E2',
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 2,
+    borderColor: '#0F0F0F',
   },
   name: {
     fontSize: 24,
@@ -304,5 +412,65 @@ const styles = StyleSheet.create({
   footerSubtext: {
     fontSize: 12,
     color: 'rgba(255, 255, 255, 0.3)',
+  },
+  modalBackdrop: {
+    flex: 1,
+    backgroundColor: 'rgba(0, 0, 0, 0.8)',
+    justifyContent: 'flex-end',
+  },
+  modalContent: {
+    backgroundColor: '#1A1A1A',
+    borderTopLeftRadius: 24,
+    borderTopRightRadius: 24,
+    padding: 24,
+    paddingBottom: 40,
+    maxHeight: '70%',
+  },
+  modalHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 24,
+  },
+  modalTitle: {
+    fontSize: 20,
+    fontWeight: '700',
+    color: '#FFFFFF',
+    letterSpacing: -0.3,
+  },
+  modalAvatarGrid: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    justifyContent: 'space-between',
+    marginHorizontal: -8,
+  },
+  modalAvatarOption: {
+    width: 80,
+    height: 80,
+    borderRadius: 40,
+    overflow: 'hidden',
+    borderWidth: 2,
+    borderColor: 'rgba(255, 255, 255, 0.2)',
+    backgroundColor: 'rgba(255, 255, 255, 0.05)',
+    position: 'relative',
+    margin: 8,
+  },
+  modalAvatarOptionSelected: {
+    borderColor: '#4A90E2',
+    borderWidth: 3,
+  },
+  modalAvatarImage: {
+    width: '100%',
+    height: '100%',
+  },
+  modalAvatarCheckmark: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    backgroundColor: 'rgba(74, 144, 226, 0.7)',
+    alignItems: 'center',
+    justifyContent: 'center',
   },
 });

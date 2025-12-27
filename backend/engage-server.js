@@ -30,6 +30,12 @@ app.use(cors({
 }));
 
 const server = http.createServer(app);
+
+// Optimize server for high concurrency
+server.maxConnections = 2000; // Allow up to 2000 concurrent connections
+server.keepAliveTimeout = 65000; // Keep connections alive
+server.headersTimeout = 66000; // Slightly higher than keepAliveTimeout
+
 const io = new Server(server, {
   cors: {
     origin: '*',
@@ -38,17 +44,38 @@ const io = new Server(server, {
   },
   transports: ['websocket', 'polling'],
   allowUpgrades: true,
+  // Optimized for 1000+ concurrent users
   pingTimeout: 60000,
   pingInterval: 25000,
   connectTimeout: 45000,
+  // Performance optimizations
+  perMessageDeflation: false, // Disable compression for lower CPU usage
+  maxHttpBufferSize: 1e6, // 1MB max message size
+  // Connection limits
+  allowEIO3: true, // Backward compatibility
 });
 
 // ====================================
-// REDIS SETUP
+// REDIS SETUP (Optimized for 1000+ concurrent users)
 // ====================================
 const redisClient = redis.createClient({
   host: process.env.REDIS_HOST || 'localhost',
   port: process.env.REDIS_PORT || 6379,
+  socket: {
+    reconnectStrategy: (retries) => {
+      if (retries > 10) {
+        console.error('[REDIS] Max reconnection attempts reached');
+        return new Error('Max reconnection attempts reached');
+      }
+      return Math.min(retries * 100, 3000);
+    },
+    keepAlive: true,
+    keepAliveInitialDelay: 10000,
+  },
+  // Connection pool settings for high concurrency
+  maxRetriesPerRequest: 3,
+  enableReadyCheck: true,
+  enableOfflineQueue: true,
 });
 
 redisClient.on('error', (err) => {
@@ -57,6 +84,14 @@ redisClient.on('error', (err) => {
 
 redisClient.on('connect', () => {
   console.log('[REDIS] Connected successfully');
+});
+
+redisClient.on('ready', () => {
+  console.log('[REDIS] ✅ Ready to accept commands');
+});
+
+redisClient.on('reconnecting', () => {
+  console.log('[REDIS] Reconnecting...');
 });
 
 (async () => {
@@ -75,6 +110,7 @@ redisClient.on('connect', () => {
 const REDIS_KEYS = {
   WATCH_ROOM: (roomId) => `watchalong:room:${roomId}`,
   CHESS_ROOM: (roomId) => `chess:room:${roomId}`,
+  CHESS_CODE: (code) => `chess:code:${code}`, // Mapping: code -> roomId
   SING_ROOM: (roomId) => `singalong:room:${roomId}`, // Phase 1: same as watch
 };
 
@@ -85,7 +121,6 @@ const REDIS_KEYS = {
 /**
  * Generate unique room ID
  * Format: room_timestamp_randomString
- * The randomString part can be used as a room code
  */
 function generateRoomId() {
   const timestamp = Date.now();
@@ -94,27 +129,28 @@ function generateRoomId() {
 }
 
 /**
- * Generate a short room code from roomId
- * Uses the random part of the roomId
+ * Generate a unique 6-digit numeric room code
+ * Retries if code already exists
  */
-function getRoomCodeFromId(roomId) {
-  const parts = roomId.split('_');
-  if (parts.length >= 3) {
-    return parts[2].substring(0, 6).toUpperCase();
+async function generateRoomCode() {
+  let attempts = 0;
+  const maxAttempts = 10;
+  
+  while (attempts < maxAttempts) {
+    // Generate 6-digit code (100000 to 999999)
+    const code = Math.floor(100000 + Math.random() * 900000).toString();
+    
+    // Check if code already exists
+    const existingRoomId = await redisClient.get(REDIS_KEYS.CHESS_CODE(code));
+    if (!existingRoomId) {
+      return code;
+    }
+    
+    attempts++;
   }
-  return roomId.slice(-6).toUpperCase();
-}
-
-/**
- * Generate a short room code from roomId
- * Uses the random part of the roomId
- */
-function getRoomCodeFromId(roomId) {
-  const parts = roomId.split('_');
-  if (parts.length >= 3) {
-    return parts[2].substring(0, 6).toUpperCase();
-  }
-  return roomId.slice(-6).toUpperCase();
+  
+  // Fallback: use timestamp-based code if all attempts fail
+  return Date.now().toString().slice(-6);
 }
 
 /**
@@ -334,88 +370,115 @@ playAlongNamespace.on('connection', (socket) => {
 
   // Create chess room
   socket.on('create_chess_room', async () => {
-    const roomId = generateRoomId();
-    const game = new Chess();
-    
-    const roomData = {
-      roomId,
-      whitePlayer: userId,
-      blackPlayer: null,
-      fen: game.fen(),
-      turn: 'white',
-      status: 'waiting', // waiting, active, finished
-      winner: null,
-      createdAt: new Date().toISOString(),
-    };
+    try {
+      const roomId = generateRoomId();
+      const roomCode = await generateRoomCode();
+      const game = new Chess();
+      
+      const roomData = {
+        roomId,
+        roomCode,
+        whitePlayer: userId,
+        blackPlayer: null,
+        fen: game.fen(),
+        turn: 'white',
+        status: 'waiting', // waiting, active, finished
+        winner: null,
+        createdAt: new Date().toISOString(),
+      };
 
-    await redisClient.setEx(REDIS_KEYS.CHESS_ROOM(roomId), 3600, JSON.stringify(roomData));
-    
-    socket.join(roomId);
-    socket.data.roomId = roomId;
-    socket.data.color = 'white';
+      // Store room data
+      await redisClient.setEx(REDIS_KEYS.CHESS_ROOM(roomId), 3600, JSON.stringify(roomData));
+      
+      // Store code -> roomId mapping
+      await redisClient.setEx(REDIS_KEYS.CHESS_CODE(roomCode), 3600, roomId);
+      
+      socket.join(roomId);
+      socket.data.roomId = roomId;
+      socket.data.color = 'white';
 
-    const roomCode = getRoomCodeFromId(roomId);
-    console.log(`[PLAY-ALONG] ✅ Chess room ${roomId} created by ${userId} (white) - Code: ${roomCode}`);
-    socket.emit('room_created', { roomId, roomCode, ...roomData });
+      console.log(`[PLAY-ALONG] ✅ Chess room ${roomId} created by ${userId} (white) - Code: ${roomCode}`);
+      socket.emit('room_created', { roomId, roomCode, ...roomData });
+    } catch (error) {
+      console.error('[PLAY-ALONG] ❌ Error creating chess room:', error);
+      socket.emit('error', { message: 'Failed to create game room' });
+    }
   });
 
   // Join chess room (accepts roomId or roomCode)
   socket.on('join_chess_room', async ({ roomId, roomCode }) => {
-    let actualRoomId = roomId;
+    try {
+      let actualRoomId = roomId;
 
-    // If roomCode provided, try to find room by code
-    if (!actualRoomId && roomCode) {
-      // Search Redis for rooms matching the code
-      const keys = await redisClient.keys(REDIS_KEYS.CHESS_ROOM('*'));
-      for (const key of keys) {
-        const roomDataStr = await redisClient.get(key);
-        if (roomDataStr) {
-          const roomData = JSON.parse(roomDataStr);
-          const codeFromId = getRoomCodeFromId(roomData.roomId);
-          if (codeFromId === roomCode.toUpperCase()) {
-            actualRoomId = roomData.roomId;
-            break;
-          }
+      // If roomCode provided, look up roomId from code mapping
+      if (!actualRoomId && roomCode) {
+        const normalizedCode = roomCode.trim().toUpperCase();
+        actualRoomId = await redisClient.get(REDIS_KEYS.CHESS_CODE(normalizedCode));
+        
+        if (!actualRoomId) {
+          socket.emit('error', { message: 'Invalid room code' });
+          return;
         }
       }
+
+      if (!actualRoomId) {
+        socket.emit('error', { message: 'Room ID or code is required' });
+        return;
+      }
+
+      const roomDataStr = await redisClient.get(REDIS_KEYS.CHESS_ROOM(actualRoomId));
+      if (!roomDataStr) {
+        socket.emit('error', { message: 'Room not found' });
+        return;
+      }
+
+      const roomData = JSON.parse(roomDataStr);
+      
+      // Check if user is already in the room
+      if (roomData.whitePlayer === userId) {
+        socket.emit('error', { message: 'You are already in this room as white player' });
+        return;
+      }
+      
+      if (roomData.blackPlayer) {
+        if (roomData.blackPlayer === userId) {
+          // Rejoining as black player
+          socket.join(actualRoomId);
+          socket.data.roomId = actualRoomId;
+          socket.data.color = 'black';
+          socket.emit('game_start', {
+            roomId: actualRoomId,
+            roomCode: roomData.roomCode,
+            ...roomData,
+          });
+          return;
+        } else {
+          socket.emit('error', { message: 'Room is full' });
+          return;
+        }
+      }
+
+      // Assign black player
+      roomData.blackPlayer = userId;
+      roomData.status = 'active';
+      await redisClient.setEx(REDIS_KEYS.CHESS_ROOM(actualRoomId), 3600, JSON.stringify(roomData));
+
+      socket.join(actualRoomId);
+      socket.data.roomId = actualRoomId;
+      socket.data.color = 'black';
+
+      console.log(`[PLAY-ALONG] ✅ User ${userId} joined room ${actualRoomId} (black) - Code: ${roomData.roomCode}`);
+      
+      // Notify both players
+      playAlongNamespace.to(actualRoomId).emit('game_start', {
+        roomId: actualRoomId,
+        roomCode: roomData.roomCode,
+        ...roomData,
+      });
+    } catch (error) {
+      console.error('[PLAY-ALONG] ❌ Error joining chess room:', error);
+      socket.emit('error', { message: 'Failed to join game room' });
     }
-
-    if (!actualRoomId) {
-      socket.emit('error', { message: 'Room ID or code is required' });
-      return;
-    }
-
-    const roomDataStr = await redisClient.get(REDIS_KEYS.CHESS_ROOM(actualRoomId));
-    if (!roomDataStr) {
-      socket.emit('error', { message: 'Room not found' });
-      return;
-    }
-
-    const roomData = JSON.parse(roomDataStr);
-    
-    if (roomData.blackPlayer) {
-      socket.emit('error', { message: 'Room is full' });
-      return;
-    }
-
-    // Assign black player
-    roomData.blackPlayer = userId;
-    roomData.status = 'active';
-    await redisClient.setEx(REDIS_KEYS.CHESS_ROOM(actualRoomId), 3600, JSON.stringify(roomData));
-
-    socket.join(actualRoomId);
-    socket.data.roomId = actualRoomId;
-    socket.data.color = 'black';
-
-    const roomCodeFinal = getRoomCodeFromId(actualRoomId);
-    console.log(`[PLAY-ALONG] ✅ User ${userId} joined room ${actualRoomId} (black) - Code: ${roomCodeFinal}`);
-    
-    // Notify both players
-    playAlongNamespace.to(actualRoomId).emit('game_start', {
-      roomId: actualRoomId,
-      roomCode: roomCodeFinal,
-      ...roomData,
-    });
   });
 
   // Make move
@@ -498,21 +561,35 @@ playAlongNamespace.on('connection', (socket) => {
 
   // Resign
   socket.on('resign', async ({ roomId }) => {
-    const roomDataStr = await redisClient.get(REDIS_KEYS.CHESS_ROOM(roomId));
-    if (!roomDataStr) return;
+    try {
+      const roomDataStr = await redisClient.get(REDIS_KEYS.CHESS_ROOM(roomId));
+      if (!roomDataStr) {
+        socket.emit('error', { message: 'Room not found' });
+        return;
+      }
 
-    const roomData = JSON.parse(roomDataStr);
-    roomData.status = 'finished';
-    roomData.winner = socket.data.color === 'white' ? 'black' : 'white';
-    await redisClient.setEx(REDIS_KEYS.CHESS_ROOM(roomId), 3600, JSON.stringify(roomData));
+      const roomData = JSON.parse(roomDataStr);
+      
+      if (roomData.status === 'finished') {
+        socket.emit('error', { message: 'Game is already finished' });
+        return;
+      }
+      
+      roomData.status = 'finished';
+      roomData.winner = socket.data.color === 'white' ? 'black' : 'white';
+      await redisClient.setEx(REDIS_KEYS.CHESS_ROOM(roomId), 3600, JSON.stringify(roomData));
 
-    console.log(`[PLAY-ALONG] 🏳️ Resign in room ${roomId} by ${socket.data.color}`);
-    
-    playAlongNamespace.to(roomId).emit('game_over', {
-      roomId,
-      winner: roomData.winner,
-      reason: 'resignation',
-    });
+      console.log(`[PLAY-ALONG] 🏳️ Resign in room ${roomId} by ${socket.data.color}`);
+      
+      playAlongNamespace.to(roomId).emit('game_over', {
+        roomId,
+        winner: roomData.winner,
+        reason: 'resignation',
+      });
+    } catch (error) {
+      console.error('[PLAY-ALONG] ❌ Error resigning:', error);
+      socket.emit('error', { message: 'Failed to resign' });
+    }
   });
 
   // Disconnect
@@ -521,12 +598,21 @@ playAlongNamespace.on('connection', (socket) => {
     if (roomId) {
       console.log(`[PLAY-ALONG] ❌ User ${userId} disconnected from room ${roomId}: ${reason}`);
       
-      // Notify opponent
-      socket.to(roomId).emit('opponent_left', { userId, roomId });
-      
-      // Clean up room
-      await redisClient.del(REDIS_KEYS.CHESS_ROOM(roomId));
-      console.log(`[PLAY-ALONG] 🧹 Room ${roomId} cleaned up`);
+      // Get room data to clean up code mapping
+      const roomDataStr = await redisClient.get(REDIS_KEYS.CHESS_ROOM(roomId));
+      if (roomDataStr) {
+        const roomData = JSON.parse(roomDataStr);
+        
+        // Notify opponent
+        socket.to(roomId).emit('opponent_left', { userId, roomId });
+        
+        // Clean up room and code mapping
+        await redisClient.del(REDIS_KEYS.CHESS_ROOM(roomId));
+        if (roomData.roomCode) {
+          await redisClient.del(REDIS_KEYS.CHESS_CODE(roomData.roomCode));
+        }
+        console.log(`[PLAY-ALONG] 🧹 Room ${roomId} (Code: ${roomData.roomCode}) cleaned up`);
+      }
     }
   });
 });
@@ -703,11 +789,26 @@ singAlongNamespace.on('connection', (socket) => {
 // ====================================
 const PORT = process.env.ENGAGE_PORT || 3002;
 
+// Connection monitoring for scalability
+let connectionCount = 0;
+io.engine.on('connection', (socket) => {
+  connectionCount++;
+  if (connectionCount % 100 === 0) {
+    console.log(`[MONITOR] Active connections: ${connectionCount}`);
+  }
+  
+  socket.on('close', () => {
+    connectionCount--;
+  });
+});
+
 server.listen(PORT, () => {
   console.log(`\n${'='.repeat(50)}`);
   console.log(`🚀 ENGAGE Socket.IO Server Running`);
   console.log(`${'='.repeat(50)}`);
   console.log(`Port: ${PORT}`);
+  console.log(`Max Connections: ${server.maxConnections}`);
+  console.log(`Optimized for: 1000+ concurrent users`);
   console.log(`Namespaces:`);
   console.log(`  - /watch-along (YouTube sync)`);
   console.log(`  - /play-along (Real-time Chess)`);
