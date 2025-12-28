@@ -18,7 +18,13 @@ if (!API_URL) {
 
 async function makeRequest(method: string, url: string, data: any, baseConfig: any, requestConfig: any) {
   const fullUrl = url.startsWith('http') ? url : `${baseConfig.baseURL || ''}${url}`;
+  console.log(`[httpClient.web] ${method} ${fullUrl}`);
+  console.log('[httpClient.web] baseConfig.baseURL:', baseConfig.baseURL);
+  console.log('[httpClient.web] url:', url);
+  console.log('[httpClient.web] fullUrl:', fullUrl);
+  
   const token = await AsyncStorage.getItem('auth_token');
+  console.log('[httpClient.web] token exists:', !!token);
   
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
@@ -30,20 +36,45 @@ async function makeRequest(method: string, url: string, data: any, baseConfig: a
     headers.Authorization = `Bearer ${token}`;
   }
   
+  console.log('[httpClient.web] Request headers:', headers);
+  console.log('[httpClient.web] Request body:', data);
+  
   const fetchOptions: RequestInit = {
     method,
     headers,
+    // Add timeout using AbortController
   };
   
   if (data) {
     fetchOptions.body = typeof data === 'string' ? data : JSON.stringify(data);
+    console.log('[httpClient.web] Request body stringified:', fetchOptions.body);
   }
   
+  // Create AbortController for timeout (10 seconds)
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => {
+    console.error('[httpClient.web] ❌ Request timeout after 10 seconds');
+    controller.abort();
+  }, 10000);
+  
+  fetchOptions.signal = controller.signal;
+  
   try {
+    console.log('[httpClient.web] 🚀 Starting fetch request...');
+    const startTime = Date.now();
     const response = await fetch(fullUrl, fetchOptions);
-    const responseData = await response.json().catch(() => ({}));
+    clearTimeout(timeoutId);
+    const duration = Date.now() - startTime;
+    console.log(`[httpClient.web] ✅ Fetch response received (${duration}ms)`, response.status, response.statusText);
+    
+    const responseData = await response.json().catch((err) => {
+      console.error('[httpClient.web] ❌ Failed to parse JSON:', err);
+      return {};
+    });
+    console.log('[httpClient.web] Response data:', responseData);
     
     if (!response.ok) {
+      console.error('[httpClient.web] ❌ Response not OK:', response.status, responseData);
       throw {
         response: {
           data: responseData,
@@ -55,8 +86,17 @@ async function makeRequest(method: string, url: string, data: any, baseConfig: a
       };
     }
     
+    console.log('[httpClient.web] ✅ Request successful');
     return { data: responseData, status: response.status, statusText: response.statusText };
   } catch (error: any) {
+    clearTimeout(timeoutId);
+    console.error('[httpClient.web] ❌ Fetch error:', error);
+    console.error('[httpClient.web] Error type:', error.constructor?.name);
+    console.error('[httpClient.web] Error name:', error.name);
+    console.error('[httpClient.web] Error message:', error.message);
+    if (error.name === 'AbortError') {
+      console.error('[httpClient.web] ❌ Request was aborted (timeout or cancelled)');
+    }
     // Handle demo mode for network errors
     const isNetworkError = error.code === 'ERR_NETWORK' || 
                           error.message?.includes('Failed to fetch') || 
