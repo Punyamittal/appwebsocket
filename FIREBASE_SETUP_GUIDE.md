@@ -88,6 +88,22 @@ The Firebase SDK should automatically use the default database URL, but if you n
           ".write": true
         }
       }
+    },
+    "watchAlongRooms": {
+      "$roomId": {
+        // Allow read/write for Watch Along rooms
+        // For development: open access (will be restricted in production)
+        ".read": true,
+        ".write": true,
+        
+        "messages": {
+          ".read": true,
+          "$messageId": {
+            ".write": true,
+            ".validate": "newData.hasChildren(['senderId', 'text', 'timestamp']) && newData.child('text').isString() && newData.child('text').val().length > 0 && newData.child('text').val().length <= 500"
+          }
+        }
+      }
     }
   }
 }

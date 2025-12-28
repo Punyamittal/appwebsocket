@@ -504,6 +504,508 @@ app.post('/api/chess/move', async (req, res) => {
 });
 
 // ====================================
+// WATCH ALONG REST API ENDPOINTS
+// ====================================
+
+// In-memory cache for Watch Along rooms (fallback when Redis unavailable)
+const watchRoomCache = new Map(); // roomId -> roomData
+const watchRoomCodeCache = new Map(); // roomCode -> roomId
+
+// Generate 6-digit room code for Watch Along
+async function generateWatchRoomCode() {
+  let attempts = 0;
+  const maxAttempts = 10;
+  
+  while (attempts < maxAttempts) {
+    const code = Math.floor(100000 + Math.random() * 900000).toString();
+    
+    // Check Redis first
+    if (redisClient && typeof redisClient.isReady === 'function' && redisClient.isReady()) {
+      try {
+        const existing = await redisClient.get(`watchalong:code:${code}`);
+        if (!existing) {
+          return code;
+        }
+      } catch (redisError) {
+        // Suppress errors
+      }
+    }
+    
+    // Check memory cache
+    if (!watchRoomCodeCache.has(code)) {
+      return code;
+    }
+    
+    attempts++;
+  }
+  
+  return Date.now().toString().slice(-6);
+}
+
+// Create Watch Along room (REST API)
+app.post('/api/watch/create', async (req, res) => {
+  try {
+    const userId = req.body.userId || req.headers['x-user-id'] || 'anonymous';
+    const { videoId, videoUrl } = req.body;
+
+    if (!videoId || !videoUrl) {
+      return res.status(400).json({ success: false, error: 'videoId and videoUrl are required' });
+    }
+
+    const roomId = generateRoomId();
+    const roomCode = await generateWatchRoomCode();
+    
+    const roomData = {
+      roomId,
+      roomCode,
+      hostId: userId,
+      videoId,
+      videoUrl,
+      isPlaying: false,
+      currentTime: 0,
+      createdAt: new Date().toISOString(),
+      participants: [userId],
+      status: 'active',
+    };
+
+    // Store in Redis if available
+    if (redisClient && typeof redisClient.isReady === 'function' && redisClient.isReady()) {
+      try {
+        await redisClient.setEx(`watchalong:room:${roomId}`, 3600, JSON.stringify(roomData));
+        await redisClient.setEx(`watchalong:code:${roomCode}`, 3600, roomId);
+      } catch (redisError) {
+        // Suppress auth errors
+      }
+    }
+    
+    // ALWAYS update memory cache
+    watchRoomCache.set(roomId, roomData);
+    watchRoomCodeCache.set(roomCode, roomId);
+
+    console.log(`[REST API] ✅ Watch Along room created: ${roomId} (Code: ${roomCode})`);
+    res.json({ success: true, ...roomData });
+  } catch (error) {
+    console.error('[REST API] ❌ Error creating Watch Along room:', error);
+    res.status(500).json({ 
+      success: false, 
+      error: error.message || 'Failed to create room',
+      details: process.env.NODE_ENV === 'development' ? error.stack : undefined
+    });
+  }
+});
+
+// Join Watch Along room (REST API)
+app.post('/api/watch/join', async (req, res) => {
+  try {
+    const userId = req.body.userId || req.headers['x-user-id'] || 'anonymous';
+    const { roomCode, roomId } = req.body;
+
+    let actualRoomId = roomId;
+
+    // If roomCode provided, look up roomId from Redis or memory cache
+    if (!actualRoomId && roomCode) {
+      const normalizedCode = roomCode.trim();
+      let foundRoomId = null;
+
+      // Try Redis first
+      if (redisClient && typeof redisClient.isReady === 'function' && redisClient.isReady()) {
+        try {
+          foundRoomId = await redisClient.get(`watchalong:code:${normalizedCode}`);
+          if (foundRoomId) {
+            console.log(`[REST API] ✅ Found Watch Along room code ${normalizedCode} in Redis, roomId: ${foundRoomId}`);
+          }
+        } catch (redisError) {
+          console.warn('[REST API] ⚠️ Redis lookup failed for Watch Along room code:', redisError.message);
+        }
+      }
+
+      // If not found in Redis, try memory cache
+      if (!foundRoomId) {
+        foundRoomId = watchRoomCodeCache.get(normalizedCode);
+        if (foundRoomId) {
+          console.log(`[REST API] ✅ Found Watch Along room code ${normalizedCode} in memory cache, roomId: ${foundRoomId}`);
+        }
+      }
+
+      if (!foundRoomId) {
+        return res.status(404).json({ success: false, error: 'Invalid room code. Room may have expired or Redis is unavailable.' });
+      }
+      actualRoomId = foundRoomId;
+    }
+
+    if (!actualRoomId) {
+      return res.status(400).json({ success: false, error: 'roomId or roomCode is required' });
+    }
+
+    // Get room data from Redis or memory cache
+    let roomDataStr = null;
+    if (redisClient && typeof redisClient.isReady === 'function' && redisClient.isReady()) {
+      try {
+        roomDataStr = await redisClient.get(`watchalong:room:${actualRoomId}`);
+      } catch (redisError) {
+        // Suppress auth errors
+      }
+    }
+    
+    // If not in Redis, try memory cache
+    if (!roomDataStr) {
+      const cachedRoom = watchRoomCache.get(actualRoomId);
+      if (cachedRoom) {
+        roomDataStr = JSON.stringify(cachedRoom);
+      }
+    }
+    
+    if (!roomDataStr) {
+      return res.status(404).json({ success: false, error: 'Room not found' });
+    }
+
+    let roomData;
+    try {
+      roomData = JSON.parse(roomDataStr);
+    } catch (parseError) {
+      return res.status(500).json({ success: false, error: 'Invalid room data format' });
+    }
+
+    // Add user to participants if not already there
+    if (!roomData.participants.includes(userId)) {
+      roomData.participants.push(userId);
+    }
+
+    // Update Redis if available
+    if (redisClient && typeof redisClient.isReady === 'function' && redisClient.isReady()) {
+      try {
+        await redisClient.setEx(`watchalong:room:${actualRoomId}`, 3600, JSON.stringify(roomData));
+      } catch (redisError) {
+        // Suppress auth errors
+      }
+    }
+    
+    // ALWAYS update memory cache
+    watchRoomCache.set(actualRoomId, roomData);
+
+    console.log(`[REST API] ✅ User ${userId} joined Watch Along room ${actualRoomId}`);
+    res.json({ 
+      success: true, 
+      ...roomData,
+      isHost: roomData.hostId === userId,
+    });
+  } catch (error) {
+    console.error('[REST API] ❌ Error joining Watch Along room:', error);
+    res.status(500).json({ 
+      success: false, 
+      error: error.message || 'Failed to join room',
+      details: process.env.NODE_ENV === 'development' ? error.stack : undefined
+    });
+  }
+});
+
+// Get Watch Along room status (REST API)
+app.get('/api/watch/room/:roomId', async (req, res) => {
+  try {
+    const { roomId } = req.params;
+
+    // Get room data from Redis or memory cache
+    let roomDataStr = null;
+    if (redisClient && typeof redisClient.isReady === 'function' && redisClient.isReady()) {
+      try {
+        roomDataStr = await redisClient.get(`watchalong:room:${roomId}`);
+      } catch (redisError) {
+        // Suppress auth errors
+      }
+    }
+    
+    // If not in Redis, try memory cache
+    if (!roomDataStr) {
+      const cachedRoom = watchRoomCache.get(roomId);
+      if (cachedRoom) {
+        roomDataStr = JSON.stringify(cachedRoom);
+      }
+    }
+    
+    if (!roomDataStr) {
+      return res.status(404).json({ success: false, error: 'Room not found' });
+    }
+
+    let roomData;
+    try {
+      roomData = JSON.parse(roomDataStr);
+    } catch (parseError) {
+      return res.status(500).json({ success: false, error: 'Invalid room data format' });
+    }
+
+    res.json({ success: true, ...roomData });
+  } catch (error) {
+    console.error('[REST API] ❌ Error getting Watch Along room status:', error);
+    res.status(500).json({ 
+      success: false, 
+      error: error.message || 'Failed to get room status',
+      details: process.env.NODE_ENV === 'development' ? error.stack : undefined
+    });
+  }
+});
+
+// Control playback (REST API) - Play
+app.post('/api/watch/play', async (req, res) => {
+  try {
+    const userId = req.body.userId || req.headers['x-user-id'] || 'anonymous';
+    const { roomId, currentTime } = req.body;
+
+    if (!roomId) {
+      return res.status(400).json({ success: false, error: 'roomId is required' });
+    }
+
+    // Get room data
+    let roomDataStr = null;
+    if (redisClient && typeof redisClient.isReady === 'function' && redisClient.isReady()) {
+      try {
+        roomDataStr = await redisClient.get(`watchalong:room:${roomId}`);
+      } catch (redisError) {
+        // Suppress auth errors
+      }
+    }
+    
+    if (!roomDataStr) {
+      const cachedRoom = watchRoomCache.get(roomId);
+      if (cachedRoom) {
+        roomDataStr = JSON.stringify(cachedRoom);
+      }
+    }
+    
+    if (!roomDataStr) {
+      return res.status(404).json({ success: false, error: 'Room not found' });
+    }
+
+    let roomData = JSON.parse(roomDataStr);
+    
+    // Check if user is host
+    if (roomData.hostId !== userId) {
+      return res.status(403).json({ success: false, error: 'Only host can control playback' });
+    }
+
+    // Update room state
+    roomData.isPlaying = true;
+    roomData.currentTime = currentTime !== undefined ? currentTime : (roomData.currentTime || 0);
+
+    // Update Redis if available
+    if (redisClient && typeof redisClient.isReady === 'function' && redisClient.isReady()) {
+      try {
+        await redisClient.setEx(`watchalong:room:${roomId}`, 3600, JSON.stringify(roomData));
+      } catch (redisError) {
+        // Suppress auth errors
+      }
+    }
+    
+    // ALWAYS update memory cache
+    watchRoomCache.set(roomId, roomData);
+
+    res.json({ success: true, ...roomData });
+  } catch (error) {
+    console.error('[REST API] ❌ Error playing Watch Along room:', error);
+    res.status(500).json({ 
+      success: false, 
+      error: error.message || 'Failed to play',
+      details: process.env.NODE_ENV === 'development' ? error.stack : undefined
+    });
+  }
+});
+
+// Control playback (REST API) - Pause
+app.post('/api/watch/pause', async (req, res) => {
+  try {
+    const userId = req.body.userId || req.headers['x-user-id'] || 'anonymous';
+    const { roomId, currentTime } = req.body;
+
+    if (!roomId) {
+      return res.status(400).json({ success: false, error: 'roomId is required' });
+    }
+
+    // Get room data
+    let roomDataStr = null;
+    if (redisClient && typeof redisClient.isReady === 'function' && redisClient.isReady()) {
+      try {
+        roomDataStr = await redisClient.get(`watchalong:room:${roomId}`);
+      } catch (redisError) {
+        // Suppress auth errors
+      }
+    }
+    
+    if (!roomDataStr) {
+      const cachedRoom = watchRoomCache.get(roomId);
+      if (cachedRoom) {
+        roomDataStr = JSON.stringify(cachedRoom);
+      }
+    }
+    
+    if (!roomDataStr) {
+      return res.status(404).json({ success: false, error: 'Room not found' });
+    }
+
+    let roomData = JSON.parse(roomDataStr);
+    
+    // Check if user is host
+    if (roomData.hostId !== userId) {
+      return res.status(403).json({ success: false, error: 'Only host can control playback' });
+    }
+
+    // Update room state
+    roomData.isPlaying = false;
+    roomData.currentTime = currentTime !== undefined ? currentTime : (roomData.currentTime || 0);
+
+    // Update Redis if available
+    if (redisClient && typeof redisClient.isReady === 'function' && redisClient.isReady()) {
+      try {
+        await redisClient.setEx(`watchalong:room:${roomId}`, 3600, JSON.stringify(roomData));
+      } catch (redisError) {
+        // Suppress auth errors
+      }
+    }
+    
+    // ALWAYS update memory cache
+    watchRoomCache.set(roomId, roomData);
+
+    res.json({ success: true, ...roomData });
+  } catch (error) {
+    console.error('[REST API] ❌ Error pausing Watch Along room:', error);
+    res.status(500).json({ 
+      success: false, 
+      error: error.message || 'Failed to pause',
+      details: process.env.NODE_ENV === 'development' ? error.stack : undefined
+    });
+  }
+});
+
+// Control playback (REST API) - Seek
+app.post('/api/watch/seek', async (req, res) => {
+  try {
+    const userId = req.body.userId || req.headers['x-user-id'] || 'anonymous';
+    const { roomId, currentTime } = req.body;
+
+    if (!roomId || currentTime === undefined) {
+      return res.status(400).json({ success: false, error: 'roomId and currentTime are required' });
+    }
+
+    // Get room data
+    let roomDataStr = null;
+    if (redisClient && typeof redisClient.isReady === 'function' && redisClient.isReady()) {
+      try {
+        roomDataStr = await redisClient.get(`watchalong:room:${roomId}`);
+      } catch (redisError) {
+        // Suppress auth errors
+      }
+    }
+    
+    if (!roomDataStr) {
+      const cachedRoom = watchRoomCache.get(roomId);
+      if (cachedRoom) {
+        roomDataStr = JSON.stringify(cachedRoom);
+      }
+    }
+    
+    if (!roomDataStr) {
+      return res.status(404).json({ success: false, error: 'Room not found' });
+    }
+
+    let roomData = JSON.parse(roomDataStr);
+    
+    // Check if user is host
+    if (roomData.hostId !== userId) {
+      return res.status(403).json({ success: false, error: 'Only host can control playback' });
+    }
+
+    // Update room state
+    roomData.currentTime = currentTime;
+
+    // Update Redis if available
+    if (redisClient && typeof redisClient.isReady === 'function' && redisClient.isReady()) {
+      try {
+        await redisClient.setEx(`watchalong:room:${roomId}`, 3600, JSON.stringify(roomData));
+      } catch (redisError) {
+        // Suppress auth errors
+      }
+    }
+    
+    // ALWAYS update memory cache
+    watchRoomCache.set(roomId, roomData);
+
+    res.json({ success: true, ...roomData });
+  } catch (error) {
+    console.error('[REST API] ❌ Error seeking Watch Along room:', error);
+    res.status(500).json({ 
+      success: false, 
+      error: error.message || 'Failed to seek',
+      details: process.env.NODE_ENV === 'development' ? error.stack : undefined
+    });
+  }
+});
+
+// Change video (REST API)
+app.post('/api/watch/change-video', async (req, res) => {
+  try {
+    const userId = req.body.userId || req.headers['x-user-id'] || 'anonymous';
+    const { roomId, videoId, videoUrl } = req.body;
+
+    if (!roomId || !videoId || !videoUrl) {
+      return res.status(400).json({ success: false, error: 'roomId, videoId, and videoUrl are required' });
+    }
+
+    // Get room data
+    let roomDataStr = null;
+    if (redisClient && typeof redisClient.isReady === 'function' && redisClient.isReady()) {
+      try {
+        roomDataStr = await redisClient.get(`watchalong:room:${roomId}`);
+      } catch (redisError) {
+        // Suppress auth errors
+      }
+    }
+    
+    if (!roomDataStr) {
+      const cachedRoom = watchRoomCache.get(roomId);
+      if (cachedRoom) {
+        roomDataStr = JSON.stringify(cachedRoom);
+      }
+    }
+    
+    if (!roomDataStr) {
+      return res.status(404).json({ success: false, error: 'Room not found' });
+    }
+
+    let roomData = JSON.parse(roomDataStr);
+    
+    // Check if user is host
+    if (roomData.hostId !== userId) {
+      return res.status(403).json({ success: false, error: 'Only host can change video' });
+    }
+
+    // Update room state
+    roomData.videoId = videoId;
+    roomData.videoUrl = videoUrl;
+    roomData.currentTime = 0;
+    roomData.isPlaying = false;
+
+    // Update Redis if available
+    if (redisClient && typeof redisClient.isReady === 'function' && redisClient.isReady()) {
+      try {
+        await redisClient.setEx(`watchalong:room:${roomId}`, 3600, JSON.stringify(roomData));
+      } catch (redisError) {
+        // Suppress auth errors
+      }
+    }
+    
+    // ALWAYS update memory cache
+    watchRoomCache.set(roomId, roomData);
+
+    res.json({ success: true, ...roomData });
+  } catch (error) {
+    console.error('[REST API] ❌ Error changing Watch Along video:', error);
+    res.status(500).json({ 
+      success: false, 
+      error: error.message || 'Failed to change video',
+      details: process.env.NODE_ENV === 'development' ? error.stack : undefined
+    });
+  }
+});
+
+// ====================================
 // SING ALONG REST API ENDPOINTS
 // ====================================
 
@@ -1122,6 +1624,7 @@ redisClient.on('reconnecting', () => {
 // ====================================
 const REDIS_KEYS = {
   WATCH_ROOM: (roomId) => `watchalong:room:${roomId}`,
+  WATCH_CODE: (code) => `watchalong:code:${code}`, // Mapping: code -> roomId
   CHESS_ROOM: (roomId) => `chess:room:${roomId}`,
   CHESS_CODE: (code) => `chess:code:${code}`, // Mapping: code -> roomId
   SING_ROOM: (roomId) => `singalong:room:${roomId}`, // Phase 1: same as watch

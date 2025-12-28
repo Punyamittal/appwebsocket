@@ -5,8 +5,26 @@
  * - Create/Join watch rooms
  * - YouTube video sync (play/pause/seek/video change)
  * - Host controls playback for all viewers
- * - Real-time sync via Socket.IO
+ * - Real-time sync via REST API + polling
  */
+
+// TypeScript declarations for YouTube IFrame API (web)
+declare global {
+  interface Window {
+    YT?: {
+      Player: any;
+      PlayerState: {
+        UNSTARTED: number;
+        ENDED: number;
+        PLAYING: number;
+        PAUSED: number;
+        BUFFERING: number;
+        CUED: number;
+      };
+    };
+    onYouTubeIframeAPIReady?: () => void;
+  }
+}
 
 import React, { useState, useEffect, useRef } from 'react';
 import {
@@ -18,13 +36,16 @@ import {
   Alert,
   ScrollView,
   ActivityIndicator,
+  Platform,
+  FlatList,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useRouter, Redirect } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
 import { useAuthStore } from '../../store/authStore';
 import engageService from '../../services/engageService';
-import { WebView } from 'react-native-webview';
+import watchApiService from '../../services/watchApiService';
+import watchAlongFirebaseService, { ChatMessage } from '../../services/watchAlongFirebaseService';
 
 // Extract YouTube video ID from URL
 function extractYouTubeId(url: string): string | null {
@@ -46,13 +67,53 @@ export default function WatchAlongScreen() {
   const [videoId, setVideoId] = useState<string | null>(null);
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
-  const webViewRef = useRef<WebView>(null);
+  const [messages, setMessages] = useState<Array<{ id: string; senderId: string; text: string; timestamp: number; senderName?: string; isSelf: boolean }>>([]);
+  const [inputMessage, setInputMessage] = useState('');
+  const [showChat, setShowChat] = useState(true);
+  const webViewRef = useRef<any>(null);
+  const iframeRef = useRef<HTMLIFrameElement | null>(null);
+  const youtubePlayerRef = useRef<any>(null);
   const socketRef = useRef<any>(null);
+  const flatListRef = useRef<any>(null);
 
   // Auth check - redirect immediately if not authenticated
   if (!user || user.is_guest || !token) {
     return <Redirect href="/welcome" />;
   }
+
+  // Initialize Firebase chat when room is created/joined
+  useEffect(() => {
+    if (roomId && roomState === 'watching') {
+      console.log('[WatchAlong] Initializing Firebase chat for room:', roomId);
+      watchAlongFirebaseService.initializeRoom(roomId).then(() => {
+        // Subscribe to messages
+        watchAlongFirebaseService.subscribeToMessages((message: ChatMessage) => {
+          const isSelf = message.senderId === user?.id;
+          setMessages((prev) => [...prev, {
+            id: message.id,
+            senderId: message.senderId,
+            text: message.text,
+            timestamp: message.timestamp,
+            senderName: message.senderName,
+            isSelf,
+          }]);
+          
+          // Auto-scroll to bottom
+          setTimeout(() => {
+            if (flatListRef.current) {
+              flatListRef.current.scrollToEnd({ animated: true });
+            }
+          }, 100);
+        });
+      }).catch((error) => {
+        console.error('[WatchAlong] Error initializing Firebase chat:', error);
+      });
+    }
+
+    return () => {
+      watchAlongFirebaseService.cleanup();
+    };
+  }, [roomId, roomState, user]);
 
   // Cleanup on unmount
   useEffect(() => {
@@ -60,106 +121,125 @@ export default function WatchAlongScreen() {
       if (socketRef.current) {
         engageService.disconnectWatchAlong();
       }
+      // Stop polling when component unmounts
+      watchApiService.stopPolling();
+      // Cleanup Firebase
+      watchAlongFirebaseService.cleanup();
     };
   }, []);
 
-  // Setup Socket.IO listeners
+  // Initialize YouTube IFrame API for web
   useEffect(() => {
-    if (!token || !user || !socketRef.current) return;
-
-    const socket = socketRef.current;
-
-    // Room created
-    socket.on('room_created', (data: any) => {
-      console.log('[WatchAlong] Room created:', data);
-      setRoomId(data.roomId);
-      setRoomCode(data.roomId.split('_')[1]?.substring(0, 6) || '');
-      setVideoId(data.videoId);
-      setIsHost(true);
-      setRoomState('watching');
-    });
-
-    // Room joined
-    socket.on('room_joined', (data: any) => {
-      console.log('[WatchAlong] Room joined:', data);
-      setRoomId(data.roomId);
-      setRoomCode(data.roomId.split('_')[1]?.substring(0, 6) || '');
-      setVideoId(data.videoId);
-      setIsHost(data.isHost);
-      setIsPlaying(data.isPlaying);
-      setCurrentTime(data.currentTime);
-      setRoomState('watching');
-    });
-
-    // Sync events
-    socket.on('sync_play', (data: { currentTime: number }) => {
-      console.log('[WatchAlong] Sync play at', data.currentTime);
-      setIsPlaying(true);
-      setCurrentTime(data.currentTime);
-      // Trigger YouTube player play
-      if (webViewRef.current) {
-        webViewRef.current.injectJavaScript(`
-          player.seekTo(${data.currentTime}, true);
-          player.playVideo();
-        `);
+    if (Platform.OS === 'web' && videoId && typeof window !== 'undefined') {
+      // Load YouTube IFrame API if not already loaded
+      if (!window.YT) {
+        const tag = document.createElement('script');
+        tag.src = 'https://www.youtube.com/iframe_api';
+        const firstScriptTag = document.getElementsByTagName('script')[0];
+        firstScriptTag.parentNode?.insertBefore(tag, firstScriptTag);
       }
-    });
 
-    socket.on('sync_pause', (data: { currentTime: number }) => {
-      console.log('[WatchAlong] Sync pause at', data.currentTime);
-      setIsPlaying(false);
-      setCurrentTime(data.currentTime);
-      if (webViewRef.current) {
-        webViewRef.current.injectJavaScript(`
-          player.seekTo(${data.currentTime}, true);
-          player.pauseVideo();
-        `);
+      // Initialize player when API is ready
+      const initPlayer = () => {
+        const container = document.getElementById('youtube-player-iframe');
+        if (window.YT && window.YT.Player && container) {
+          // Destroy existing player if any
+          if (youtubePlayerRef.current) {
+            try {
+              youtubePlayerRef.current.destroy();
+            } catch (e) {
+              // Ignore errors
+            }
+          }
+
+          console.log('[WatchAlong] Initializing YouTube player with videoId:', videoId);
+          youtubePlayerRef.current = new window.YT.Player('youtube-player-iframe', {
+            height: '100%',
+            width: '100%',
+            videoId: videoId,
+            playerVars: {
+              playsinline: 1,
+              controls: isHost ? 1 : 0,
+              modestbranding: 1,
+              enablejsapi: 1,
+            },
+            events: {
+              onReady: (event: any) => {
+                console.log('[WatchAlong] YouTube player ready');
+                event.target.seekTo(currentTime, true);
+                if (isPlaying) {
+                  event.target.playVideo();
+                } else {
+                  event.target.pauseVideo();
+                }
+              },
+              onStateChange: (event: any) => {
+                // Only update state if user is host (to avoid feedback loop)
+                if (isHost) {
+                  if (event.data === window.YT!.PlayerState.PLAYING) {
+                    setIsPlaying(true);
+                  } else if (event.data === window.YT!.PlayerState.PAUSED) {
+                    setIsPlaying(false);
+                  }
+                }
+              },
+              onError: (event: any) => {
+                console.error('[WatchAlong] YouTube player error:', event.data);
+              },
+            },
+          });
+        } else {
+          console.warn('[WatchAlong] Cannot initialize player - YT:', !!window.YT, 'Container:', !!container);
+        }
+      };
+
+      if (window.YT && window.YT.Player) {
+        initPlayer();
+      } else {
+        window.onYouTubeIframeAPIReady = initPlayer;
       }
-    });
 
-    socket.on('sync_seek', (data: { currentTime: number }) => {
-      console.log('[WatchAlong] Sync seek to', data.currentTime);
-      setCurrentTime(data.currentTime);
-      if (webViewRef.current) {
-        webViewRef.current.injectJavaScript(`
-          player.seekTo(${data.currentTime}, true);
-        `);
+      return () => {
+        if (youtubePlayerRef.current) {
+          try {
+            youtubePlayerRef.current.destroy();
+          } catch (e) {
+            // Ignore errors
+          }
+          youtubePlayerRef.current = null;
+        }
+      };
+    }
+  }, [videoId, isHost]); // Only re-init when videoId or host status changes
+
+  // Sync video player when state changes (web)
+  useEffect(() => {
+    if (Platform.OS === 'web' && youtubePlayerRef.current && videoId) {
+      try {
+        // Only sync if player is ready
+        const playerState = youtubePlayerRef.current.getPlayerState();
+        if (playerState !== window.YT?.PlayerState.UNSTARTED) {
+          // Sync time
+          const currentPlayerTime = youtubePlayerRef.current.getCurrentTime();
+          const timeDiff = Math.abs(currentPlayerTime - currentTime);
+          
+          // Only seek if difference is significant (more than 1 second)
+          if (timeDiff > 1) {
+            youtubePlayerRef.current.seekTo(currentTime, true);
+          }
+          
+          // Sync play/pause state
+          if (isPlaying && playerState !== window.YT?.PlayerState.PLAYING) {
+            youtubePlayerRef.current.playVideo();
+          } else if (!isPlaying && playerState === window.YT?.PlayerState.PLAYING) {
+            youtubePlayerRef.current.pauseVideo();
+          }
+        }
+      } catch (e) {
+        console.warn('[WatchAlong] Error syncing YouTube player:', e);
       }
-    });
-
-    socket.on('sync_video', (data: { videoId: string; videoUrl: string }) => {
-      console.log('[WatchAlong] Sync video change to', data.videoId);
-      setVideoId(data.videoId);
-      setVideoUrl(data.videoUrl);
-      setCurrentTime(0);
-      setIsPlaying(false);
-    });
-
-    socket.on('participant_joined', (data: { userId: string }) => {
-      Alert.alert('Participant Joined', 'Someone joined your watch room!');
-    });
-
-    socket.on('participant_left', (data: { userId: string }) => {
-      Alert.alert('Participant Left', 'Someone left the watch room.');
-    });
-
-    socket.on('error', (error: { message: string }) => {
-      Alert.alert('Error', error.message);
-      setRoomState('error');
-    });
-
-    return () => {
-      socket.off('room_created');
-      socket.off('room_joined');
-      socket.off('sync_play');
-      socket.off('sync_pause');
-      socket.off('sync_seek');
-      socket.off('sync_video');
-      socket.off('participant_joined');
-      socket.off('participant_left');
-      socket.off('error');
-    };
-  }, [token, user, roomId]);
+    }
+  }, [currentTime, isPlaying, videoId]);
 
   const handleCreateRoom = async () => {
     if (!videoUrl.trim()) {
@@ -181,46 +261,88 @@ export default function WatchAlongScreen() {
     setRoomState('creating');
 
     try {
-      // Connect to Watch Along namespace
-      const socket = engageService.connectWatchAlong(token, user.id);
-      socketRef.current = socket;
+      console.log('[WatchAlong] Creating room via REST API...');
+      const result = await watchApiService.createRoom(user.id, extractedId, videoUrl.trim());
+      
+      if (!result.success) {
+        throw new Error(result.error || 'Failed to create room');
+      }
 
-      // Wait for connection
-      await new Promise((resolve, reject) => {
-        if (socket.connected) {
-          resolve(null);
-          return;
+      if (!result.roomId) {
+        throw new Error('Invalid response from server');
+      }
+
+      console.log(`[WatchAlong] ✅ Room created: ${result.roomId} (Code: ${result.roomCode})`);
+      
+      // Update state
+      setRoomId(result.roomId);
+      setRoomCode(result.roomCode);
+      setVideoId(result.videoId || extractedId);
+      setIsHost(true);
+      setIsPlaying(result.isPlaying || false);
+      setCurrentTime(result.currentTime || 0);
+      setRoomState('watching');
+      
+      // Start polling for updates
+      watchApiService.startPolling(result.roomId, (data) => {
+        console.log('[WatchAlong] Room update:', data);
+        if (data.videoId) setVideoId(data.videoId);
+        if (data.videoUrl) setVideoUrl(data.videoUrl);
+        if (data.isPlaying !== undefined) setIsPlaying(data.isPlaying);
+        if (data.currentTime !== undefined) {
+          setCurrentTime(data.currentTime);
         }
-
-        const timeout = setTimeout(() => {
-          reject(new Error('Connection timeout'));
-        }, 10000);
-
-        socket.once('connect', () => {
-          clearTimeout(timeout);
-          resolve(null);
-        });
-
-        socket.once('connect_error', (error) => {
-          clearTimeout(timeout);
-          reject(error);
-        });
-      });
-
-      // Create room
-      socket.emit('create_watch_room', {
-        videoId: extractedId,
-        videoUrl: videoUrl.trim(),
-      });
+        
+        // Sync video player
+        if (Platform.OS === 'web' && youtubePlayerRef.current && !isHost) {
+          // Web: Use YouTube IFrame API
+          try {
+            const playerState = youtubePlayerRef.current.getPlayerState();
+            if (playerState !== window.YT?.PlayerState.UNSTARTED) {
+              const currentPlayerTime = youtubePlayerRef.current.getCurrentTime();
+              const timeDiff = Math.abs(currentPlayerTime - (data.currentTime || 0));
+              
+              // Only seek if difference is significant (more than 1 second)
+              if (timeDiff > 1 && data.currentTime !== undefined) {
+                youtubePlayerRef.current.seekTo(data.currentTime, true);
+              }
+              
+              // Sync play/pause state
+              if (data.isPlaying && playerState !== window.YT?.PlayerState.PLAYING) {
+                youtubePlayerRef.current.playVideo();
+              } else if (!data.isPlaying && playerState === window.YT?.PlayerState.PLAYING) {
+                youtubePlayerRef.current.pauseVideo();
+              }
+            }
+          } catch (e) {
+            console.warn('[WatchAlong] Error syncing YouTube player:', e);
+          }
+        } else if (Platform.OS !== 'web' && webViewRef.current && !isHost) {
+          // Native: Use WebView injectJavaScript
+          webViewRef.current.injectJavaScript(`
+            if (player) {
+              player.seekTo(${data.currentTime || 0}, true);
+              ${data.isPlaying ? 'player.playVideo();' : 'player.pauseVideo();'}
+            }
+          `);
+        }
+      }, 2000); // Poll every 2 seconds
+      
     } catch (error: any) {
-      Alert.alert('Error', error.message || 'Failed to create room');
+      console.error('[WatchAlong] Create room error:', error);
+      Alert.alert(
+        'Connection Error', 
+        error.message || 'Failed to create room. Make sure:\n\n1. Engage server is running (port 3002)\n2. Redis is running\n3. Check your network connection'
+      );
       setRoomState('error');
     }
   };
 
   const handleJoinRoom = async () => {
-    if (!roomCode || roomCode.length < 6) {
-      Alert.alert('Error', 'Please enter a valid room code');
+    const codeToJoin = roomCode?.trim() || '';
+    
+    if (!codeToJoin || codeToJoin.length !== 6) {
+      Alert.alert('Error', 'Please enter a valid 6-digit room code');
       return;
     }
 
@@ -232,35 +354,76 @@ export default function WatchAlongScreen() {
     setRoomState('joining');
 
     try {
-      const socket = engageService.connectWatchAlong(token, user.id);
-      socketRef.current = socket;
+      console.log(`[WatchAlong] Joining room with code: ${codeToJoin}`);
+      const result = await watchApiService.joinRoom(user.id, codeToJoin);
+      
+      if (!result.success) {
+        throw new Error(result.error || 'Failed to join room');
+      }
 
-      await new Promise((resolve, reject) => {
-        if (socket.connected) {
-          resolve(null);
-          return;
+      if (!result.roomId) {
+        throw new Error('Invalid response from server');
+      }
+
+      console.log(`[WatchAlong] ✅ Joined room: ${result.roomId}`);
+      
+      // Update state
+      setRoomId(result.roomId);
+      setRoomCode(result.roomCode || codeToJoin);
+      setVideoId(result.videoId);
+      setVideoUrl(result.videoUrl || '');
+      setIsHost(result.isHost || false);
+      setIsPlaying(result.isPlaying || false);
+      setCurrentTime(result.currentTime || 0);
+      setRoomState('watching');
+      
+      // Start polling for updates
+      watchApiService.startPolling(result.roomId, (data) => {
+        console.log('[WatchAlong] Room update:', data);
+        if (data.videoId) setVideoId(data.videoId);
+        if (data.videoUrl) setVideoUrl(data.videoUrl);
+        if (data.isPlaying !== undefined) setIsPlaying(data.isPlaying);
+        if (data.currentTime !== undefined) {
+          setCurrentTime(data.currentTime);
         }
-
-        const timeout = setTimeout(() => {
-          reject(new Error('Connection timeout'));
-        }, 10000);
-
-        socket.once('connect', () => {
-          clearTimeout(timeout);
-          resolve(null);
-        });
-
-        socket.once('connect_error', (error) => {
-          clearTimeout(timeout);
-          reject(error);
-        });
-      });
-
-      // Find full room ID from code (in production, use a lookup)
-      // For now, assume roomCode is part of roomId
-      const fullRoomId = `room_${roomCode}`;
-      socket.emit('join_watch_room', { roomId: fullRoomId });
+        
+        // Sync video player
+        if (Platform.OS === 'web' && youtubePlayerRef.current && !isHost) {
+          // Web: Use YouTube IFrame API
+          try {
+            const playerState = youtubePlayerRef.current.getPlayerState();
+            if (playerState !== window.YT?.PlayerState.UNSTARTED) {
+              const currentPlayerTime = youtubePlayerRef.current.getCurrentTime();
+              const timeDiff = Math.abs(currentPlayerTime - (data.currentTime || 0));
+              
+              // Only seek if difference is significant (more than 1 second)
+              if (timeDiff > 1 && data.currentTime !== undefined) {
+                youtubePlayerRef.current.seekTo(data.currentTime, true);
+              }
+              
+              // Sync play/pause state
+              if (data.isPlaying && playerState !== window.YT?.PlayerState.PLAYING) {
+                youtubePlayerRef.current.playVideo();
+              } else if (!data.isPlaying && playerState === window.YT?.PlayerState.PLAYING) {
+                youtubePlayerRef.current.pauseVideo();
+              }
+            }
+          } catch (e) {
+            console.warn('[WatchAlong] Error syncing YouTube player:', e);
+          }
+        } else if (Platform.OS !== 'web' && webViewRef.current && !isHost) {
+          // Native: Use WebView injectJavaScript
+          webViewRef.current.injectJavaScript(`
+            if (player) {
+              player.seekTo(${data.currentTime || 0}, true);
+              ${data.isPlaying ? 'player.playVideo();' : 'player.pauseVideo();'}
+            }
+          `);
+        }
+      }, 2000); // Poll every 2 seconds
+      
     } catch (error: any) {
+      console.error('[WatchAlong] Join room error:', error);
       Alert.alert('Error', error.message || 'Failed to join room');
       setRoomState('error');
     }
@@ -366,21 +529,52 @@ export default function WatchAlongScreen() {
         </View>
 
         <View style={styles.playerContainer}>
-          <WebView
-            ref={webViewRef}
-            source={{ html: getYouTubeHTML(videoId) }}
-            style={styles.webview}
-            javaScriptEnabled={true}
-            domStorageEnabled={true}
-            onMessage={(event) => {
-              const data = JSON.parse(event.nativeEvent.data);
-              if (data.type === 'playing') {
-                setIsPlaying(true);
-              } else if (data.type === 'paused') {
-                setIsPlaying(false);
+          {Platform.OS === 'web' ? (
+            // Web: Use div container - YouTube IFrame API will create the iframe
+            <div 
+              id="youtube-player-iframe" 
+              style={{ 
+                width: '100%', 
+                height: '100%',
+                backgroundColor: '#000',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center'
+              }}
+            />
+          ) : (
+            // Native: Use WebView (conditionally imported)
+            (() => {
+              try {
+                const { WebView } = require('react-native-webview');
+                return (
+                  <WebView
+                    ref={webViewRef}
+                    source={{ html: getYouTubeHTML(videoId) }}
+                    style={styles.webview}
+                    javaScriptEnabled={true}
+                    domStorageEnabled={true}
+                    onMessage={(event: any) => {
+                      const data = JSON.parse(event.nativeEvent.data);
+                      if (data.type === 'playing') {
+                        setIsPlaying(true);
+                      } else if (data.type === 'paused') {
+                        setIsPlaying(false);
+                      }
+                    }}
+                  />
+                );
+              } catch (e) {
+                return (
+                  <View style={styles.webview}>
+                    <Text style={{ color: '#fff', textAlign: 'center', padding: 20 }}>
+                      WebView not available on this platform
+                    </Text>
+                  </View>
+                );
               }
-            }}
-          />
+            })()
+          )}
         </View>
 
         {isHost && (
@@ -404,6 +598,106 @@ export default function WatchAlongScreen() {
           <View style={styles.viewerBadge}>
             <Text style={styles.viewerText}>Viewer - Waiting for host to control playback</Text>
           </View>
+        )}
+
+        {/* Chat Section */}
+        {showChat && (
+          <View style={styles.chatSection}>
+            <View style={styles.chatHeader}>
+              <Text style={styles.chatHeaderText}>Chat</Text>
+              <TouchableOpacity onPress={() => setShowChat(false)}>
+                <Ionicons name="chevron-down" size={20} color="#FFFFFF" />
+              </TouchableOpacity>
+            </View>
+            
+            <View style={styles.chatMessagesContainer}>
+              <FlatList
+                ref={flatListRef}
+                data={messages}
+                keyExtractor={(item) => item.id}
+                style={styles.chatMessagesList}
+                contentContainerStyle={styles.chatMessagesContent}
+                renderItem={({ item }) => (
+                  <View
+                    style={[
+                      styles.chatMessage,
+                      item.isSelf ? styles.chatMessageSelf : styles.chatMessageOther,
+                    ]}
+                  >
+                    {!item.isSelf && item.senderName && (
+                      <Text style={styles.chatMessageSender}>{item.senderName}</Text>
+                    )}
+                    <Text style={styles.chatMessageText}>{item.text}</Text>
+                  </View>
+                )}
+              />
+            </View>
+
+            <View style={styles.chatInputContainer}>
+              <TextInput
+                style={styles.chatInput}
+                placeholder="Type a message..."
+                placeholderTextColor="#999"
+                value={inputMessage}
+                onChangeText={setInputMessage}
+                multiline={false}
+              />
+              <TouchableOpacity
+                style={[styles.chatSendButton, !inputMessage.trim() && styles.chatSendButtonDisabled]}
+                onPress={async () => {
+                  if (!inputMessage.trim() || !roomId || !user) return;
+                  
+                  const messageText = inputMessage.trim();
+                  setInputMessage('');
+                  
+                  // Optimistically add message
+                  const optimisticMessage = {
+                    id: `temp_${Date.now()}`,
+                    senderId: user.id,
+                    text: messageText,
+                    timestamp: Date.now(),
+                    senderName: user.name || `User ${user.id.substring(0, 8)}`,
+                    isSelf: true,
+                  };
+                  setMessages((prev) => [...prev, optimisticMessage]);
+                  
+                  try {
+                    await watchAlongFirebaseService.sendMessage(
+                      messageText,
+                      user.id,
+                      user.name || undefined
+                    );
+                    console.log('[WatchAlong] ✅ Message sent');
+                  } catch (error: any) {
+                    console.error('[WatchAlong] ❌ Error sending message:', error);
+                    // Remove optimistic message on error
+                    setMessages((prev) => prev.filter((msg) => msg.id !== optimisticMessage.id));
+                    Alert.alert('Error', 'Failed to send message');
+                  }
+                  
+                  // Auto-scroll
+                  setTimeout(() => {
+                    if (flatListRef.current) {
+                      flatListRef.current.scrollToEnd({ animated: true });
+                    }
+                  }, 100);
+                }}
+                disabled={!inputMessage.trim()}
+              >
+                <Ionicons name="send" size={20} color="#FFFFFF" />
+              </TouchableOpacity>
+            </View>
+          </View>
+        )}
+
+        {!showChat && (
+          <TouchableOpacity
+            style={styles.chatToggleButton}
+            onPress={() => setShowChat(true)}
+          >
+            <Ionicons name="chatbubble-outline" size={20} color="#FFFFFF" />
+            <Text style={styles.chatToggleText}>Chat</Text>
+          </TouchableOpacity>
         )}
       </SafeAreaView>
     );
@@ -676,5 +970,99 @@ const styles = StyleSheet.create({
   viewerText: {
     color: 'rgba(255, 255, 255, 0.6)',
     fontSize: 14,
+  },
+  chatSection: {
+    backgroundColor: '#1A1A1A',
+    borderTopWidth: 1,
+    borderTopColor: 'rgba(255, 255, 255, 0.1)',
+    maxHeight: 300,
+  },
+  chatHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    padding: 12,
+    borderBottomWidth: 1,
+    borderBottomColor: 'rgba(255, 255, 255, 0.1)',
+  },
+  chatHeaderText: {
+    color: '#FFFFFF',
+    fontSize: 16,
+    fontWeight: '600',
+  },
+  chatMessagesContainer: {
+    flex: 1,
+    maxHeight: 200,
+  },
+  chatMessagesList: {
+    flex: 1,
+  },
+  chatMessagesContent: {
+    padding: 8,
+  },
+  chatMessage: {
+    marginBottom: 8,
+    padding: 8,
+    borderRadius: 8,
+    maxWidth: '80%',
+  },
+  chatMessageSelf: {
+    backgroundColor: '#4A90E2',
+    alignSelf: 'flex-end',
+  },
+  chatMessageOther: {
+    backgroundColor: '#2A2A2A',
+    alignSelf: 'flex-start',
+  },
+  chatMessageSender: {
+    fontSize: 12,
+    color: 'rgba(255, 255, 255, 0.6)',
+    marginBottom: 4,
+  },
+  chatMessageText: {
+    color: '#FFFFFF',
+    fontSize: 14,
+  },
+  chatInputContainer: {
+    flexDirection: 'row',
+    padding: 12,
+    borderTopWidth: 1,
+    borderTopColor: 'rgba(255, 255, 255, 0.1)',
+    alignItems: 'center',
+  },
+  chatInput: {
+    flex: 1,
+    backgroundColor: '#2A2A2A',
+    borderRadius: 20,
+    paddingHorizontal: 16,
+    paddingVertical: 8,
+    fontSize: 14,
+    color: '#FFFFFF',
+    marginRight: 8,
+  },
+  chatSendButton: {
+    backgroundColor: '#4A90E2',
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  chatSendButtonDisabled: {
+    opacity: 0.5,
+  },
+  chatToggleButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: 12,
+    backgroundColor: '#1A1A1A',
+    borderTopWidth: 1,
+    borderTopColor: 'rgba(255, 255, 255, 0.1)',
+  },
+  chatToggleText: {
+    color: '#FFFFFF',
+    fontSize: 14,
+    marginLeft: 8,
   },
 });
