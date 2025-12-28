@@ -4,13 +4,31 @@
  * Phase 1: Same as Watch Along
  * - YouTube karaoke video sync
  * - Host controls playback
- * - Real-time sync via Socket.IO
+ * - Real-time sync via REST API + polling
  * 
  * Phase 2 (Future):
  * - WebRTC audio rooms
  * - Echo cancellation
  * - Push-to-sing mode
  */
+
+// TypeScript declarations for YouTube IFrame API (web)
+declare global {
+  interface Window {
+    YT?: {
+      Player: any;
+      PlayerState: {
+        UNSTARTED: number;
+        ENDED: number;
+        PLAYING: number;
+        PAUSED: number;
+        BUFFERING: number;
+        CUED: number;
+      };
+    };
+    onYouTubeIframeAPIReady?: () => void;
+  }
+}
 
 import React, { useState, useEffect, useRef } from 'react';
 import {
@@ -22,13 +40,14 @@ import {
   Alert,
   ScrollView,
   ActivityIndicator,
+  Platform,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useRouter, Redirect } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
 import { useAuthStore } from '../../store/authStore';
 import engageService from '../../services/engageService';
-import { WebView } from 'react-native-webview';
+import singApiService from '../../services/singApiService';
 
 // Extract YouTube video ID from URL
 function extractYouTubeId(url: string): string | null {
@@ -50,7 +69,9 @@ export default function SingAlongScreen() {
   const [videoId, setVideoId] = useState<string | null>(null);
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
-  const webViewRef = useRef<WebView>(null);
+  const webViewRef = useRef<any>(null);
+  const iframeRef = useRef<HTMLIFrameElement | null>(null);
+  const youtubePlayerRef = useRef<any>(null);
   const socketRef = useRef<any>(null);
 
   // Auth check - redirect immediately if not authenticated
@@ -64,98 +85,116 @@ export default function SingAlongScreen() {
       if (socketRef.current) {
         engageService.disconnectSingAlong();
       }
+      // Stop polling when component unmounts
+      singApiService.stopPolling();
     };
   }, []);
 
-  // Setup Socket.IO listeners (same as Watch Along)
+  // Initialize YouTube IFrame API for web
   useEffect(() => {
-    if (!token || !user || !socketRef.current) return;
-
-    const socket = socketRef.current;
-
-    socket.on('room_created', (data: any) => {
-      console.log('[SingAlong] Room created:', data);
-      setRoomId(data.roomId);
-      setRoomCode(data.roomId.split('_')[1]?.substring(0, 6) || '');
-      setVideoId(data.videoId);
-      setIsHost(true);
-      setRoomState('singing');
-    });
-
-    socket.on('room_joined', (data: any) => {
-      console.log('[SingAlong] Room joined:', data);
-      setRoomId(data.roomId);
-      setRoomCode(data.roomId.split('_')[1]?.substring(0, 6) || '');
-      setVideoId(data.videoId);
-      setIsHost(data.isHost);
-      setIsPlaying(data.isPlaying);
-      setCurrentTime(data.currentTime);
-      setRoomState('singing');
-    });
-
-    socket.on('sync_play', (data: { currentTime: number }) => {
-      setIsPlaying(true);
-      setCurrentTime(data.currentTime);
-      if (webViewRef.current) {
-        webViewRef.current.injectJavaScript(`
-          player.seekTo(${data.currentTime}, true);
-          player.playVideo();
-        `);
+    if (Platform.OS === 'web' && videoId && typeof window !== 'undefined') {
+      // Load YouTube IFrame API if not already loaded
+      if (!window.YT) {
+        const tag = document.createElement('script');
+        tag.src = 'https://www.youtube.com/iframe_api';
+        const firstScriptTag = document.getElementsByTagName('script')[0];
+        firstScriptTag.parentNode?.insertBefore(tag, firstScriptTag);
       }
-    });
 
-    socket.on('sync_pause', (data: { currentTime: number }) => {
-      setIsPlaying(false);
-      setCurrentTime(data.currentTime);
-      if (webViewRef.current) {
-        webViewRef.current.injectJavaScript(`
-          player.seekTo(${data.currentTime}, true);
-          player.pauseVideo();
-        `);
+      // Initialize player when API is ready
+      const initPlayer = () => {
+        if (window.YT && window.YT.Player && iframeRef.current) {
+          // Destroy existing player if any
+          if (youtubePlayerRef.current) {
+            try {
+              youtubePlayerRef.current.destroy();
+            } catch (e) {
+              // Ignore errors
+            }
+          }
+
+          youtubePlayerRef.current = new window.YT.Player('youtube-player-iframe', {
+            height: '100%',
+            width: '100%',
+            videoId: videoId,
+            playerVars: {
+              playsinline: 1,
+              controls: isHost ? 1 : 0,
+              modestbranding: 1,
+              enablejsapi: 1,
+            },
+            events: {
+              onReady: (event: any) => {
+                console.log('[SingAlong] YouTube player ready');
+                event.target.seekTo(currentTime, true);
+                if (isPlaying) {
+                  event.target.playVideo();
+                } else {
+                  event.target.pauseVideo();
+                }
+              },
+              onStateChange: (event: any) => {
+                // Only update state if user is host (to avoid feedback loop)
+                if (isHost) {
+                  if (event.data === window.YT!.PlayerState.PLAYING) {
+                    setIsPlaying(true);
+                  } else if (event.data === window.YT!.PlayerState.PAUSED) {
+                    setIsPlaying(false);
+                  }
+                }
+              },
+            },
+          });
+        }
+      };
+
+      if (window.YT && window.YT.Player) {
+        initPlayer();
+      } else {
+        window.onYouTubeIframeAPIReady = initPlayer;
       }
-    });
 
-    socket.on('sync_seek', (data: { currentTime: number }) => {
-      setCurrentTime(data.currentTime);
-      if (webViewRef.current) {
-        webViewRef.current.injectJavaScript(`
-          player.seekTo(${data.currentTime}, true);
-        `);
+      return () => {
+        if (youtubePlayerRef.current) {
+          try {
+            youtubePlayerRef.current.destroy();
+          } catch (e) {
+            // Ignore errors
+          }
+          youtubePlayerRef.current = null;
+        }
+      };
+    }
+  }, [videoId, isHost]); // Only re-init when videoId or host status changes
+
+  // Sync video player when state changes (web)
+  useEffect(() => {
+    if (Platform.OS === 'web' && youtubePlayerRef.current && videoId) {
+      try {
+        // Only sync if player is ready
+        const playerState = youtubePlayerRef.current.getPlayerState();
+        if (playerState !== window.YT?.PlayerState.UNSTARTED) {
+          // Sync time
+          const currentPlayerTime = youtubePlayerRef.current.getCurrentTime();
+          const timeDiff = Math.abs(currentPlayerTime - currentTime);
+          
+          // Only seek if difference is significant (more than 1 second)
+          if (timeDiff > 1) {
+            youtubePlayerRef.current.seekTo(currentTime, true);
+          }
+          
+          // Sync play/pause state
+          if (isPlaying && playerState !== window.YT?.PlayerState.PLAYING) {
+            youtubePlayerRef.current.playVideo();
+          } else if (!isPlaying && playerState === window.YT?.PlayerState.PLAYING) {
+            youtubePlayerRef.current.pauseVideo();
+          }
+        }
+      } catch (e) {
+        console.warn('[SingAlong] Error syncing YouTube player:', e);
       }
-    });
-
-    socket.on('sync_video', (data: { videoId: string; videoUrl: string }) => {
-      setVideoId(data.videoId);
-      setVideoUrl(data.videoUrl);
-      setCurrentTime(0);
-      setIsPlaying(false);
-    });
-
-    socket.on('participant_joined', () => {
-      Alert.alert('Participant Joined', 'Someone joined your karaoke room!');
-    });
-
-    socket.on('participant_left', () => {
-      Alert.alert('Participant Left', 'Someone left the karaoke room.');
-    });
-
-    socket.on('error', (error: { message: string }) => {
-      Alert.alert('Error', error.message);
-      setRoomState('error');
-    });
-
-    return () => {
-      socket.off('room_created');
-      socket.off('room_joined');
-      socket.off('sync_play');
-      socket.off('sync_pause');
-      socket.off('sync_seek');
-      socket.off('sync_video');
-      socket.off('participant_joined');
-      socket.off('participant_left');
-      socket.off('error');
-    };
-  }, [token, user, roomId]);
+    }
+  }, [currentTime, isPlaying, videoId]);
 
   const handleCreateRoom = async () => {
     if (!videoUrl.trim()) {
@@ -177,43 +216,63 @@ export default function SingAlongScreen() {
     setRoomState('creating');
 
     try {
-      const socket = engageService.connectSingAlong(token, user.id);
-      socketRef.current = socket;
+      console.log('[SingAlong] Creating room via REST API...');
+      const result = await singApiService.createRoom(user.id, extractedId, videoUrl.trim());
+      
+      if (!result.success) {
+        throw new Error(result.error || 'Failed to create room');
+      }
 
-      await new Promise((resolve, reject) => {
-        if (socket.connected) {
-          resolve(null);
-          return;
+      if (!result.roomId) {
+        throw new Error('Invalid response from server');
+      }
+
+      console.log(`[SingAlong] ✅ Room created: ${result.roomId} (Code: ${result.roomCode})`);
+      
+      // Update state
+      setRoomId(result.roomId);
+      setRoomCode(result.roomCode);
+      setVideoId(result.videoId || extractedId);
+      setIsHost(true);
+      setIsPlaying(result.isPlaying || false);
+      setCurrentTime(result.currentTime || 0);
+      setRoomState('singing');
+      
+      // Start polling for updates
+      singApiService.startPolling(result.roomId, (data) => {
+        console.log('[SingAlong] Room update:', data);
+        if (data.videoId) setVideoId(data.videoId);
+        if (data.videoUrl) setVideoUrl(data.videoUrl);
+        if (data.isPlaying !== undefined) setIsPlaying(data.isPlaying);
+        if (data.currentTime !== undefined) {
+          setCurrentTime(data.currentTime);
+          // Sync video player (native only - web uses iframe)
+          if (Platform.OS !== 'web' && webViewRef.current && !isHost) {
+            webViewRef.current.injectJavaScript(`
+              if (player) {
+                player.seekTo(${data.currentTime}, true);
+                ${data.isPlaying ? 'player.playVideo();' : 'player.pauseVideo();'}
+              }
+            `);
+          }
         }
-
-        const timeout = setTimeout(() => {
-          reject(new Error('Connection timeout'));
-        }, 10000);
-
-        socket.once('connect', () => {
-          clearTimeout(timeout);
-          resolve(null);
-        });
-
-        socket.once('connect_error', (error) => {
-          clearTimeout(timeout);
-          reject(error);
-        });
-      });
-
-      socket.emit('create_sing_room', {
-        videoId: extractedId,
-        videoUrl: videoUrl.trim(),
-      });
+      }, 2000); // Poll every 2 seconds
+      
     } catch (error: any) {
-      Alert.alert('Error', error.message || 'Failed to create room');
+      console.error('[SingAlong] Create room error:', error);
+      Alert.alert(
+        'Connection Error', 
+        error.message || 'Failed to create room. Make sure:\n\n1. Engage server is running (port 3002)\n2. Redis is running\n3. Check your network connection'
+      );
       setRoomState('error');
     }
   };
 
   const handleJoinRoom = async () => {
-    if (!roomCode || roomCode.length < 6) {
-      Alert.alert('Error', 'Please enter a valid room code');
+    const codeToJoin = roomCode?.trim() || '';
+    
+    if (!codeToJoin || codeToJoin.length !== 6) {
+      Alert.alert('Error', 'Please enter a valid 6-digit room code');
       return;
     }
 
@@ -225,47 +284,196 @@ export default function SingAlongScreen() {
     setRoomState('joining');
 
     try {
-      const socket = engageService.connectSingAlong(token, user.id);
-      socketRef.current = socket;
+      console.log(`[SingAlong] Joining room with code: ${codeToJoin}`);
+      const result = await singApiService.joinRoom(user.id, codeToJoin);
+      
+      if (!result.success) {
+        throw new Error(result.error || 'Failed to join room');
+      }
 
-      await new Promise((resolve, reject) => {
-        if (socket.connected) {
-          resolve(null);
-          return;
+      if (!result.roomId) {
+        throw new Error('Invalid response from server');
+      }
+
+      console.log(`[SingAlong] ✅ Joined room: ${result.roomId}`);
+      
+      // Update state
+      setRoomId(result.roomId);
+      setRoomCode(result.roomCode || codeToJoin);
+      setVideoId(result.videoId);
+      setVideoUrl(result.videoUrl || '');
+      setIsHost(result.isHost || false);
+      setIsPlaying(result.isPlaying || false);
+      setCurrentTime(result.currentTime || 0);
+      setRoomState('singing');
+      
+      // Start polling for updates
+      singApiService.startPolling(result.roomId, (data) => {
+        console.log('[SingAlong] Room update:', data);
+        if (data.videoId) setVideoId(data.videoId);
+        if (data.videoUrl) setVideoUrl(data.videoUrl);
+        if (data.isPlaying !== undefined) setIsPlaying(data.isPlaying);
+        if (data.currentTime !== undefined) {
+          setCurrentTime(data.currentTime);
         }
-
-        const timeout = setTimeout(() => {
-          reject(new Error('Connection timeout'));
-        }, 10000);
-
-        socket.once('connect', () => {
-          clearTimeout(timeout);
-          resolve(null);
-        });
-
-        socket.once('connect_error', (error) => {
-          clearTimeout(timeout);
-          reject(error);
-        });
-      });
-
-      const fullRoomId = `room_${roomCode}`;
-      socket.emit('join_sing_room', { roomId: fullRoomId });
+        if (data.isPlaying !== undefined) {
+          setIsPlaying(data.isPlaying);
+        }
+        
+        // Sync video player
+        if (Platform.OS === 'web' && youtubePlayerRef.current && !isHost) {
+          // Web: Use YouTube IFrame API
+          try {
+            const playerState = youtubePlayerRef.current.getPlayerState();
+            if (playerState !== window.YT?.PlayerState.UNSTARTED) {
+              const currentPlayerTime = youtubePlayerRef.current.getCurrentTime();
+              const timeDiff = Math.abs(currentPlayerTime - (data.currentTime || 0));
+              
+              // Only seek if difference is significant (more than 1 second)
+              if (timeDiff > 1 && data.currentTime !== undefined) {
+                youtubePlayerRef.current.seekTo(data.currentTime, true);
+              }
+              
+              // Sync play/pause state
+              if (data.isPlaying && playerState !== window.YT?.PlayerState.PLAYING) {
+                youtubePlayerRef.current.playVideo();
+              } else if (!data.isPlaying && playerState === window.YT?.PlayerState.PLAYING) {
+                youtubePlayerRef.current.pauseVideo();
+              }
+            }
+          } catch (e) {
+            console.warn('[SingAlong] Error syncing YouTube player:', e);
+          }
+        } else if (Platform.OS !== 'web' && webViewRef.current && !isHost) {
+          // Native: Use WebView injectJavaScript
+          webViewRef.current.injectJavaScript(`
+            if (player) {
+              player.seekTo(${data.currentTime || 0}, true);
+              ${data.isPlaying ? 'player.playVideo();' : 'player.pauseVideo();'}
+            }
+          `);
+        }
+      }, 2000); // Poll every 2 seconds
+      
     } catch (error: any) {
+      console.error('[SingAlong] Join room error:', error);
       Alert.alert('Error', error.message || 'Failed to join room');
       setRoomState('error');
     }
   };
 
   // Host controls
-  const handlePlay = () => {
-    if (!isHost || !socketRef.current || !roomId) return;
-    socketRef.current.emit('play', { roomId, currentTime });
+  const handlePlay = async () => {
+    if (!isHost || !roomId || !user) return;
+    
+    // Get current time from player if available
+    let timeToSync = currentTime;
+    if (Platform.OS === 'web' && youtubePlayerRef.current) {
+      try {
+        timeToSync = youtubePlayerRef.current.getCurrentTime();
+      } catch (e) {
+        // Use state value if player not ready
+      }
+    }
+    
+    try {
+      const result = await singApiService.play(roomId, user.id, timeToSync);
+      if (result.success) {
+        setIsPlaying(true);
+        if (result.currentTime !== undefined) {
+          setCurrentTime(result.currentTime);
+        }
+        // Also play local player (host)
+        if (Platform.OS === 'web' && youtubePlayerRef.current) {
+          youtubePlayerRef.current.playVideo();
+        }
+      } else {
+        Alert.alert('Error', result.error || 'Failed to play');
+      }
+    } catch (error: any) {
+      console.error('[SingAlong] Play error:', error);
+      Alert.alert('Error', error.message || 'Failed to play');
+    }
   };
 
-  const handlePause = () => {
-    if (!isHost || !socketRef.current || !roomId) return;
-    socketRef.current.emit('pause', { roomId, currentTime });
+  const handlePause = async () => {
+    if (!isHost || !roomId || !user) return;
+    
+    // Get current time from player if available
+    let timeToSync = currentTime;
+    if (Platform.OS === 'web' && youtubePlayerRef.current) {
+      try {
+        timeToSync = youtubePlayerRef.current.getCurrentTime();
+      } catch (e) {
+        // Use state value if player not ready
+      }
+    }
+    
+    try {
+      const result = await singApiService.pause(roomId, user.id, timeToSync);
+      if (result.success) {
+        setIsPlaying(false);
+        if (result.currentTime !== undefined) {
+          setCurrentTime(result.currentTime);
+        }
+        // Also pause local player (host)
+        if (Platform.OS === 'web' && youtubePlayerRef.current) {
+          youtubePlayerRef.current.pauseVideo();
+        }
+      } else {
+        Alert.alert('Error', result.error || 'Failed to pause');
+      }
+    } catch (error: any) {
+      console.error('[SingAlong] Pause error:', error);
+      Alert.alert('Error', error.message || 'Failed to pause');
+    }
+  };
+
+  const handleSeek = async (time: number) => {
+    if (!isHost || !roomId || !user) return;
+    
+    try {
+      const result = await singApiService.seek(roomId, user.id, time);
+      if (result.success) {
+        setCurrentTime(time);
+        // Seek local player (host)
+        if (Platform.OS === 'web' && youtubePlayerRef.current) {
+          youtubePlayerRef.current.seekTo(time, true);
+        } else if (Platform.OS !== 'web' && webViewRef.current) {
+          webViewRef.current.injectJavaScript(`player.seekTo(${time}, true);`);
+        }
+      } else {
+        Alert.alert('Error', result.error || 'Failed to seek');
+      }
+    } catch (error: any) {
+      console.error('[SingAlong] Seek error:', error);
+      Alert.alert('Error', error.message || 'Failed to seek');
+    }
+  };
+
+  const handleChangeVideo = async (newUrl: string) => {
+    if (!isHost || !roomId || !user) return;
+    
+    const newId = extractYouTubeId(newUrl);
+    if (!newId) {
+      Alert.alert('Error', 'Invalid YouTube URL');
+      return;
+    }
+    
+    try {
+      const result = await singApiService.changeVideo(roomId, user.id, newId, newUrl);
+      if (result.success) {
+        setVideoId(newId);
+        setVideoUrl(newUrl);
+        setCurrentTime(0);
+        setIsPlaying(false);
+      } else {
+        Alert.alert('Error', result.error || 'Failed to change video');
+      }
+    } catch (error: any) {
+      console.error('[SingAlong] Change video error:', error);
+      Alert.alert('Error', error.message || 'Failed to change video');
+    }
   };
 
   // YouTube iframe HTML
@@ -340,21 +548,52 @@ export default function SingAlongScreen() {
         </View>
 
         <View style={styles.playerContainer}>
-          <WebView
-            ref={webViewRef}
-            source={{ html: getYouTubeHTML(videoId) }}
-            style={styles.webview}
-            javaScriptEnabled={true}
-            domStorageEnabled={true}
-            onMessage={(event) => {
-              const data = JSON.parse(event.nativeEvent.data);
-              if (data.type === 'playing') {
-                setIsPlaying(true);
-              } else if (data.type === 'paused') {
-                setIsPlaying(false);
+          {Platform.OS === 'web' ? (
+            // Web: Use iframe directly with YouTube embed
+            <iframe
+              ref={iframeRef}
+              width="100%"
+              height="100%"
+              src={`https://www.youtube.com/embed/${videoId}?enablejsapi=1&playsinline=1&controls=${isHost ? 1 : 0}&modestbranding=1&start=${Math.floor(currentTime)}`}
+              frameBorder="0"
+              allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
+              allowFullScreen
+              style={{ border: 'none', width: '100%', height: '100%' }}
+              id="youtube-player-iframe"
+            />
+          ) : (
+            // Native: Use WebView (conditionally imported)
+            (() => {
+              try {
+                const { WebView } = require('react-native-webview');
+                return (
+                  <WebView
+                    ref={webViewRef}
+                    source={{ html: getYouTubeHTML(videoId) }}
+                    style={styles.webview}
+                    javaScriptEnabled={true}
+                    domStorageEnabled={true}
+                    onMessage={(event: any) => {
+                      const data = JSON.parse(event.nativeEvent.data);
+                      if (data.type === 'playing') {
+                        setIsPlaying(true);
+                      } else if (data.type === 'paused') {
+                        setIsPlaying(false);
+                      }
+                    }}
+                  />
+                );
+              } catch (e) {
+                return (
+                  <View style={styles.webview}>
+                    <Text style={{ color: '#fff', textAlign: 'center', padding: 20 }}>
+                      WebView not available on this platform
+                    </Text>
+                  </View>
+                );
               }
-            }}
-          />
+            })()
+          )}
         </View>
 
         {isHost && (

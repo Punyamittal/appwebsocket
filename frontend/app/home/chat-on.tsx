@@ -55,6 +55,9 @@ export default function ChatOnScreen() {
   const [inputMessage, setInputMessage] = useState('');
   const [roomId, setRoomId] = useState<string | null>(null);
   const [chatState, setChatState] = useState<ChatState>('idle');
+  const [partnerId, setPartnerId] = useState<string | null>(null);
+  const [partnerName, setPartnerName] = useState<string | null>(null);
+  const [roomReady, setRoomReady] = useState(false); // True when both users are in room
   const flatListRef = useRef<FlatList>(null);
 
   // Debug: Watch for roomId changes
@@ -105,20 +108,25 @@ export default function ChatOnScreen() {
       await skipOnService.startChat(
         userId,
         // onMatched - use functional updates to ensure state updates work
-        (foundRoomId: string) => {
-          console.log('[ChatOn] 🎉 Match found! Room:', foundRoomId);
+        (foundRoomId: string, foundPartnerId?: string, foundPartnerName?: string) => {
+          console.log('[ChatOn] 🎉 Match found! Room:', foundRoomId, 'Partner:', foundPartnerId, 'Name:', foundPartnerName);
           console.log('[ChatOn] Current chatState before update:', chatState);
           console.log('[ChatOn] Setting roomId and chatState to chatting...');
           
-          // Add a welcome message to show the user they're connected
-          const welcomeMessage: ChatMessage = {
-            message_id: `welcome_${Date.now()}`,
-            message: "You're connected! Say hi 👋",
-            timestamp: new Date().toISOString(),
-            is_self: false,
-          };
+          // Clear messages - real messages will come from Firebase
+          setMessages([]);
+          setRoomReady(false); // Room not ready until both users join
           
-          setMessages([welcomeMessage]);
+          // Store partner info if provided
+          if (foundPartnerId) {
+            setPartnerId(foundPartnerId);
+          }
+          if (foundPartnerName) {
+            setPartnerName(foundPartnerName);
+          } else if (foundPartnerId) {
+            // Fallback: use partner ID as name
+            setPartnerName(foundPartnerId.substring(0, 8));
+          }
           
           // Use functional updates to ensure React batches these correctly
           setRoomId((prevRoomId) => {
@@ -165,6 +173,11 @@ export default function ChatOnScreen() {
           console.error('[ChatOn] ❌ Error:', error);
           Alert.alert('Error', error);
           setChatState('error');
+        },
+        // onRoomReady - called when both users have joined
+        () => {
+          console.log('[ChatOn] ✅ Room is ready - both users joined');
+          setRoomReady(true);
         }
       );
 
@@ -181,6 +194,12 @@ export default function ChatOnScreen() {
    */
   const handleSendMessage = async () => {
     if (!inputMessage.trim() || !roomId) {
+      return;
+    }
+    
+    // Don't allow messages until room is ready (both users joined)
+    if (!roomReady) {
+      Alert.alert('Waiting', 'Waiting for partner to join the room...');
       return;
     }
 
@@ -330,7 +349,8 @@ export default function ChatOnScreen() {
         <SafeAreaView style={styles.contentContainer} edges={[]}>
           <View style={styles.searchingContainer}>
             <ActivityIndicator size="large" color="#4A90E2" />
-            <Text style={styles.searchingText}>Finding someone to chat with...</Text>
+            <Text style={styles.searchingText}>Connecting...</Text>
+            <Text style={styles.searchingSubtext}>Finding someone to chat with</Text>
             <Text style={styles.searchingHint}>
               💡 Tip: Open another browser tab or window to test matching!
             </Text>
@@ -355,7 +375,9 @@ export default function ChatOnScreen() {
       <TopNavigation />
       <View style={styles.header}>
         <View style={styles.statusDot} />
-        <Text style={styles.headerText}>Connected</Text>
+        <Text style={styles.headerText}>
+          {partnerName || (partnerId ? `Chatting with ${partnerId.substring(0, 8)}...` : 'Chatting with someone')}
+        </Text>
         <TouchableOpacity style={styles.skipButton} onPress={handleSkip}>
           <Ionicons name="play-skip-forward" size={18} color="#FFFFFF" />
           <Text style={styles.skipButtonText}>Skip</Text>
@@ -378,19 +400,25 @@ export default function ChatOnScreen() {
         />
 
         <View style={[styles.inputContainer, { paddingBottom: insets.bottom + 8 }]}>
+          {!roomReady && (
+            <View style={styles.waitingBanner}>
+              <Text style={styles.waitingText}>Waiting for partner to join...</Text>
+            </View>
+          )}
           <TextInput
-            style={styles.input}
-            placeholder="Type a message..."
+            style={[styles.input, !roomReady && styles.inputDisabled]}
+            placeholder={roomReady ? "Type a message..." : "Waiting for partner..."}
             placeholderTextColor="rgba(255, 255, 255, 0.5)"
             value={inputMessage}
             onChangeText={setInputMessage}
             multiline
             maxLength={500}
+            editable={roomReady}
           />
           <TouchableOpacity
-            style={[styles.sendButton, !inputMessage.trim() && styles.sendButtonDisabled]}
+            style={[styles.sendButton, (!roomReady || !inputMessage.trim()) && styles.sendButtonDisabled]}
             onPress={handleSendMessage}
-            disabled={!inputMessage.trim()}
+            disabled={!roomReady || !inputMessage.trim()}
           >
             <Ionicons name="send" size={20} color="#FFFFFF" />
           </TouchableOpacity>
@@ -627,5 +655,20 @@ const styles = StyleSheet.create({
   },
   sendButtonDisabled: {
     opacity: 0.4,
+  },
+  waitingBanner: {
+    backgroundColor: 'rgba(74, 144, 226, 0.2)',
+    padding: 8,
+    borderRadius: 8,
+    marginBottom: 8,
+    alignItems: 'center',
+  },
+  waitingText: {
+    color: '#4A90E2',
+    fontSize: 12,
+    fontWeight: '500',
+  },
+  inputDisabled: {
+    opacity: 0.5,
   },
 });

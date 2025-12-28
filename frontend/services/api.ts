@@ -7,7 +7,7 @@ import httpClient from './httpClient';
 // Get backend URL from environment
 let API_URL = Constants.expoConfig?.extra?.EXPO_PUBLIC_BACKEND_URL || process.env.EXPO_PUBLIC_BACKEND_URL;
 if (!API_URL) {
-  API_URL = 'http://localhost:3003';
+  API_URL = 'http://localhost:3001';
   console.warn('⚠️ No backend URL configured, using default:', API_URL);
 } else {
   console.log('✅ Backend URL configured:', API_URL);

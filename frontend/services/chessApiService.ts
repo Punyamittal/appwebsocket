@@ -241,6 +241,60 @@ class ChessApiService {
       console.log('[ChessApiService] Stopped polling');
     }
   }
+
+  /**
+   * Make a chess move
+   */
+  async makeMove(
+    roomId: string,
+    userId: string,
+    from: string,
+    to: string,
+    promotion?: string
+  ): Promise<{
+    success: boolean;
+    fen?: string;
+    turn?: string;
+    status?: string;
+    winner?: string;
+    error?: string;
+  }> {
+    try {
+      const response = await this.request<{
+        success: boolean;
+        fen?: string;
+        turn?: string;
+        status?: string;
+        winner?: string;
+        error?: string;
+      }>('/api/chess/move', {
+        method: 'POST',
+        body: JSON.stringify({
+          roomId,
+          userId,
+          from,
+          to,
+          promotion,
+        }),
+        headers: {
+          'X-User-Id': userId,
+        },
+      });
+
+      if (response.success) {
+        console.log(`[ChessApiService] ✅ Move made: ${from}→${to}`);
+        return response;
+      } else {
+        throw new Error(response.error || 'Failed to make move');
+      }
+    } catch (error: any) {
+      console.error('[ChessApiService] ❌ Error making move:', error.message);
+      return {
+        success: false,
+        error: error.message || 'Failed to make move',
+      };
+    }
+  }
 }
 
 // Export singleton instance

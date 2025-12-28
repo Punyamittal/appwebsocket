@@ -18,6 +18,7 @@ export interface MatchResult {
   status: 'matched' | 'searching';
   roomId?: string;
   partnerId?: string;
+  partnerName?: string;
   isPartnerGuest?: boolean;
 }
 
@@ -124,7 +125,12 @@ class SkipOnRESTService {
       console.log('[SkipOnREST] Full response:', response);
       
       // Validate response
-      if (!response.data || (response.data.status !== 'matched' && response.data.status !== 'searching')) {
+      if (!response.data) {
+        console.error('[SkipOnREST] ❌ Null response from backend - server may not be running');
+        throw new Error('Backend server is not available. Please ensure the FastAPI server is running on port 3001.');
+      }
+      
+      if (response.data.status !== 'matched' && response.data.status !== 'searching') {
         console.error('[SkipOnREST] ❌ Invalid response structure:', response.data);
         throw new Error(`Invalid response from backend: ${JSON.stringify(response.data)}`);
       }
@@ -167,7 +173,18 @@ class SkipOnRESTService {
       await api.post('/skip/leave', body, { headers });
       console.log('✅ SkipOnREST: Left matchmaking/room');
     } catch (error: any) {
-      console.error('❌ SkipOnREST: Leave error:', error);
+      // Don't log as error - leaving is best-effort, especially during cleanup
+      // Only log if it's not a network/server error (which is expected if server is down)
+      const isServerError = error.code === 'ERR_NETWORK' || 
+                           error.response?.status === 404 || 
+                           error.response?.status === 503 ||
+                           error.message?.includes('Backend server is not available');
+      
+      if (!isServerError) {
+        console.warn('⚠️ SkipOnREST: Leave request failed (non-critical):', error.message || 'Unknown error');
+      } else {
+        console.log('ℹ️ SkipOnREST: Leave request skipped (server unavailable - expected during cleanup)');
+      }
       // Don't throw - leaving is best-effort
     }
   }

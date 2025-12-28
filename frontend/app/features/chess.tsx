@@ -25,6 +25,7 @@ import { Ionicons } from '@expo/vector-icons';
 import { useAuthStore } from '../../store/authStore';
 import engageService from '../../services/engageService';
 import chessApiService from '../../services/chessApiService';
+import ChessBoard from '../../components/ChessBoard';
 
 type GameState = 'idle' | 'waiting' | 'active' | 'finished';
 type PlayerColor = 'white' | 'black' | null;
@@ -245,19 +246,50 @@ export default function ChessScreen() {
     }
   };
 
-  const handleMakeMove = (from: string, to: string, promotion?: string) => {
-    if (!socketRef.current || !roomId || gameState !== 'active') return;
+  const handleMakeMove = async (from: string, to: string, promotion?: string) => {
+    if (!roomId || gameState !== 'active') {
+      Alert.alert('Error', 'Game is not active');
+      return;
+    }
+    
     if (currentTurn !== playerColor) {
       Alert.alert('Not Your Turn', 'Wait for your opponent to move.');
       return;
     }
 
-    socketRef.current.emit('make_move', {
-      roomId,
-      from,
-      to,
-      promotion,
-    });
+    if (!user || !user.id) {
+      Alert.alert('Error', 'User not authenticated');
+      return;
+    }
+
+    try {
+      console.log(`[Chess] Making move: ${from} → ${to}`);
+      const result = await chessApiService.makeMove(roomId, user.id, from, to, promotion);
+      
+      if (!result.success) {
+        Alert.alert('Invalid Move', result.error || 'Move could not be made');
+        return;
+      }
+
+      // Update state immediately (optimistic update)
+      if (result.fen) setFen(result.fen);
+      if (result.turn) setCurrentTurn(result.turn);
+      if (result.status) {
+        setGameState(result.status === 'finished' ? 'finished' : 'active');
+      }
+      if (result.winner) {
+        setWinner(result.winner);
+        if (result.status === 'finished') {
+          Alert.alert(
+            'Game Over',
+            result.winner === 'draw' ? 'Draw!' : `Winner: ${result.winner}`
+          );
+        }
+      }
+    } catch (error: any) {
+      console.error('[Chess] Move error:', error);
+      Alert.alert('Error', error.message || 'Failed to make move');
+    }
   };
 
   const handleResign = () => {
@@ -317,30 +349,30 @@ export default function ChessScreen() {
             </View>
           )}
 
-          {/* Chess Board Placeholder */}
-          <View style={styles.boardPlaceholder}>
-            <Text style={styles.chessIcon}>♔</Text>
-            <Text style={styles.boardText}>Chess Board</Text>
-            <Text style={styles.boardSubtext}>
-              {gameState === 'finished'
-                ? `Game Over - ${winner === 'draw' ? 'Draw' : `Winner: ${winner}`}`
-                : isWaitingForOpponent
-                ? 'Waiting for opponent...'
-                : `Your Color: ${playerColor?.toUpperCase() || 'WHITE'}`}
-            </Text>
-            {!isWaitingForOpponent && (
-              <>
-                <Text style={styles.boardSubtext}>
-                  Current Turn: {currentTurn?.toUpperCase() || 'WHITE'}
-                </Text>
-                {fen && (
-                  <Text style={styles.boardSubtext}>
-                    FEN: {fen.substring(0, 30)}...
-                  </Text>
-                )}
-              </>
-            )}
-          </View>
+          {/* Chess Board */}
+          {fen && playerColor && !isWaitingForOpponent ? (
+            <View style={styles.boardContainer}>
+              <ChessBoard
+                fen={fen}
+                playerColor={playerColor}
+                currentTurn={currentTurn}
+                onMove={handleMakeMove}
+                disabled={gameState !== 'active' || currentTurn !== playerColor}
+              />
+            </View>
+          ) : (
+            <View style={styles.boardPlaceholder}>
+              <Text style={styles.chessIcon}>♔</Text>
+              <Text style={styles.boardText}>Chess Board</Text>
+              <Text style={styles.boardSubtext}>
+                {gameState === 'finished'
+                  ? `Game Over - ${winner === 'draw' ? 'Draw' : `Winner: ${winner}`}`
+                  : isWaitingForOpponent
+                  ? 'Waiting for opponent...'
+                  : 'Loading board...'}
+              </Text>
+            </View>
+          )}
 
           {/* Game Info */}
           <View style={styles.gameInfo}>

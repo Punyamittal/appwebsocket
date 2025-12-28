@@ -23,7 +23,7 @@ export interface ChatMessageData {
 class SkipOnService {
   private currentRoomId: string | null = null;
   private currentUserId: string | null = null;
-  private onMatchFoundCallback: ((roomId: string) => void) | null = null;
+  private onMatchFoundCallback: ((roomId: string, partnerId?: string, partnerName?: string) => void) | null = null;
   private onMessageCallback: ((message: ChatMessageData) => void) | null = null;
   private onRoomEndedCallback: (() => void) | null = null;
   private firebaseCleanup: (() => void) | null = null;
@@ -35,16 +35,19 @@ class SkipOnService {
    */
   async startChat(
     clientId: string,
-    onMatched: (roomId: string) => void,
+    onMatched: (roomId: string, partnerId?: string, partnerName?: string) => void,
     onMessage: (message: ChatMessageData) => void,
     onPartnerLeft: () => void,
-    onError?: (error: string) => void
+    onError?: (error: string) => void,
+    onRoomReady?: () => void
   ): Promise<void> {
     try {
       this.currentUserId = clientId;
       this.onMatchFoundCallback = onMatched;
       this.onMessageCallback = onMessage;
       this.onRoomEndedCallback = onPartnerLeft;
+      this.onRoomReadyCallback = onRoomReady;
+      this.onRoomReadyCallback = onRoomReady;
 
       console.log('[SkipOn] Starting matchmaking for user:', clientId);
       console.log('[SkipOn] Callbacks set - onMatched:', typeof onMatched, 'onMessage:', typeof onMessage);
@@ -219,9 +222,10 @@ class SkipOnService {
     // IMPORTANT: Notify callback FIRST, before Firebase initialization
     // This ensures the UI updates immediately even if Firebase fails
     if (this.onMatchFoundCallback) {
-      console.log('[SkipOn] Calling onMatchFoundCallback with roomId:', result.roomId);
+      console.log('[SkipOn] Calling onMatchFoundCallback with roomId:', result.roomId, 'partnerId:', result.partnerId, 'partnerName:', result.partnerName);
       try {
-        this.onMatchFoundCallback(result.roomId);
+        // Pass roomId, partnerId, and partnerName to the callback
+        this.onMatchFoundCallback(result.roomId, result.partnerId, result.partnerName);
         console.log('[SkipOn] ✅ Callback called successfully');
       } catch (error) {
         console.error('[SkipOn] ❌ Error in onMatchFoundCallback:', error);
@@ -278,6 +282,13 @@ class SkipOnService {
           // Partner left
           if (this.onRoomEndedCallback) {
             this.onRoomEndedCallback();
+          }
+        },
+        () => {
+          console.log('[SkipOn] ✅ Room is ready - both users joined');
+          // Room is ready - notify callback
+          if (this.onRoomReadyCallback) {
+            this.onRoomReadyCallback();
           }
         }
       );
@@ -350,9 +361,10 @@ class SkipOnService {
     // Stop polling
     this.stopStatusPolling();
 
-    // Leave queue/room
-    skipOnRESTService.leave().catch(() => {
-      // Ignore errors during cleanup
+    // Leave queue/room (best effort - don't fail if server is down)
+    skipOnRESTService.leave().catch((error) => {
+      // Silently ignore errors during cleanup - server might be down
+      console.log('[SkipOn] Cleanup: Leave request failed (non-critical):', error.message || 'Server unavailable');
     });
 
     // Cleanup Firebase
