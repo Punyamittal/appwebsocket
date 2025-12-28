@@ -71,41 +71,77 @@ class SkipOnFirebaseService {
       throw new Error('Firebase Database not initialized');
     }
 
-    console.log(`🏗️ SkipOnFirebase: Database is initialized, creating room...`);
+    console.log(`🏗️ SkipOnFirebase: Database is initialized, creating/joining room...`);
     this.currentRoomId = roomId;
 
     const roomRef = ref(this.db, `skipOnRooms/${roomId}`);
     console.log(`🏗️ SkipOnFirebase: Room ref path: skipOnRooms/${roomId}`);
     
-    const roomData = {
-      users: {
-        [userId]: true,
-        [partnerId]: true,
-      },
-      status: 'active',
-      createdAt: Date.now(),
-    };
+    // Check if room already exists (partner might have created it)
+    const existingRoom = await get(roomRef);
     
-    console.log(`🏗️ SkipOnFirebase: Room data to write:`, roomData);
-    
-    try {
-      await set(roomRef, roomData);
-      console.log(`✅ SkipOnFirebase: Room ${roomId} initialized in Firebase`);
+    if (existingRoom.exists()) {
+      // Room exists - mark this user as joined
+      console.log(`🏗️ SkipOnFirebase: Room exists, marking user ${userId} as joined`);
+      const userRef = ref(this.db, `skipOnRooms/${roomId}/users/${userId}`);
+      await set(userRef, {
+        joined: true,
+        joinedAt: Date.now(),
+      });
       
-      // Verify room was created
-      const verifyRef = ref(this.db, `skipOnRooms/${roomId}`);
-      const verifySnapshot = await get(verifyRef);
-      if (verifySnapshot.exists()) {
-        console.log(`✅ SkipOnFirebase: Room verified in Firebase:`, verifySnapshot.val());
-      } else {
-        console.error(`❌ SkipOnFirebase: Room was not created in Firebase!`);
+      // Update user count and check if both users are joined
+      const roomData = existingRoom.val();
+      const users = roomData?.users || {};
+      const joinedUsers = Object.keys(users).filter((uid) => {
+        const userData = users[uid];
+        return userData === true || (typeof userData === 'object' && userData?.joined === true);
+      });
+      const userCount = joinedUsers.length;
+      
+      console.log(`🏗️ SkipOnFirebase: User count after join: ${userCount}`);
+      
+      // If both users are now joined, activate room
+      if (userCount >= 2) {
+        const statusRef = ref(this.db, `skipOnRooms/${roomId}/status`);
+        await set(statusRef, 'active');
+        console.log(`✅ SkipOnFirebase: Room activated - both users joined`);
       }
-    } catch (error: any) {
-      console.error(`❌ SkipOnFirebase: Error initializing room:`, error);
-      console.error(`❌ SkipOnFirebase: Error code:`, error.code);
-      console.error(`❌ SkipOnFirebase: Error message:`, error.message);
-      console.error(`❌ SkipOnFirebase: Error details:`, error.stack);
-      throw error;
+    } else {
+      // Room doesn't exist - create it
+      console.log(`🏗️ SkipOnFirebase: Creating new room`);
+      const roomData = {
+        users: {
+          [userId]: {
+            joined: true,
+            joinedAt: Date.now(),
+          },
+          [partnerId]: {
+            joined: false, // Partner hasn't joined yet
+            joinedAt: null,
+          },
+        },
+        status: 'waiting', // 'waiting' until both join, then 'active'
+        createdAt: Date.now(),
+      };
+      
+      console.log(`🏗️ SkipOnFirebase: Room data to write:`, roomData);
+      
+      try {
+        await set(roomRef, roomData);
+        console.log(`✅ SkipOnFirebase: Room ${roomId} created in Firebase`);
+      } catch (error: any) {
+        console.error(`❌ SkipOnFirebase: Error creating room:`, error);
+        throw error;
+      }
+    }
+    
+    // Verify room was created/updated
+    const verifyRef = ref(this.db, `skipOnRooms/${roomId}`);
+    const verifySnapshot = await get(verifyRef);
+    if (verifySnapshot.exists()) {
+      console.log(`✅ SkipOnFirebase: Room verified in Firebase:`, verifySnapshot.val());
+    } else {
+      console.error(`❌ SkipOnFirebase: Room was not created in Firebase!`);
     }
   }
 
@@ -123,6 +159,26 @@ class SkipOnFirebaseService {
     if (!roomId || !senderId || !text.trim()) {
       console.error(`❌ SkipOnFirebase: Missing required fields - roomId: ${roomId}, senderId: ${senderId}, text: "${text}"`);
       throw new Error('roomId, senderId, and text are required');
+    }
+    
+    // Check if room is active (both users joined)
+    const roomRef = ref(this.db, `skipOnRooms/${roomId}`);
+    const roomSnapshot = await get(roomRef);
+    
+    if (!roomSnapshot.exists()) {
+      throw new Error('Room does not exist');
+    }
+    
+    const roomData = roomSnapshot.val();
+    const status = roomData?.status;
+    const users = roomData?.users || {};
+    const joinedUsers = Object.keys(users).filter((uid) => users[uid]?.joined === true);
+    const userCount = joinedUsers.length;
+    
+    console.log(`📤 SkipOnFirebase: Room status: ${status}, userCount: ${userCount}`);
+    
+    if (status !== 'active' || userCount < 2) {
+      throw new Error('Room is not ready. Waiting for partner to join...');
     }
 
     const messagesRef = ref(this.db, `skipOnRooms/${roomId}/messages`);
@@ -173,7 +229,8 @@ class SkipOnFirebaseService {
     roomId: string,
     currentUserId: string,
     onMessage: (message: ChatMessage) => void,
-    onPartnerLeft?: () => void
+    onPartnerLeft?: () => void,
+    onRoomReady?: () => void
   ): () => void {
     if (!this.db) {
       console.error('❌ SkipOnFirebase: Database not initialized');
@@ -257,16 +314,42 @@ class SkipOnFirebaseService {
     
     console.log(`📡 SkipOnFirebase: Listener set up, waiting for messages...`);
 
-    // Listen for room status changes (partner left)
-    const statusRef = ref(this.db, `skipOnRooms/${roomId}/status`);
+    // Listen for room status changes (partner joined, partner left)
+    const roomRef = ref(this.db, `skipOnRooms/${roomId}`);
     
-    const unsubscribeStatus = onValue(statusRef, (snapshot) => {
+    const unsubscribeStatus = onValue(roomRef, (snapshot) => {
       if (!snapshot.exists()) return;
 
-      const status = snapshot.val();
+      const roomData = snapshot.val();
+      const status = roomData?.status;
+      const users = roomData?.users || {};
+      const joinedUsers = Object.keys(users).filter((uid) => {
+        const userData = users[uid];
+        return userData === true || (typeof userData === 'object' && userData?.joined === true);
+      });
+      const userCount = joinedUsers.length;
+      
+      console.log(`📡 SkipOnFirebase: Room status update - status: ${status}, userCount: ${userCount}`);
+      
+      // Check if partner left
       if (status === 'ended' && onPartnerLeft) {
         console.log('🚪 SkipOnFirebase: Room ended, partner left');
         onPartnerLeft();
+      }
+      
+      // Update room status to 'active' when both users have joined
+      if (userCount === 2 && status === 'waiting') {
+        console.log('✅ SkipOnFirebase: Both users joined, activating room');
+        const statusRef = ref(this.db, `skipOnRooms/${roomId}/status`);
+        set(statusRef, 'active').catch((error) => {
+          console.error('❌ SkipOnFirebase: Error updating room status:', error);
+        });
+      }
+      
+      // Notify when room is ready (both users joined)
+      if (status === 'active' && userCount >= 2 && onRoomReady) {
+        console.log('✅ SkipOnFirebase: Room is ready - both users joined');
+        onRoomReady();
       }
     });
 

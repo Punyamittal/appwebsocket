@@ -852,50 +852,59 @@ async def skip_match(
             partnerId = room['user1Id'] if room['user1Id'] != userId else room['user2Id']
             partnerIsGuest = room['user1IsGuest'] if room['user1Id'] != userId else room['user2IsGuest']
             
-            logger.info(f"✅ Skip On: User {userId} already in room {roomId} with partner {partnerId}")
-            logger.info(f"✅ Skip On: Returning matched response for existing room")
-            
-            return {
-                "status": "matched",
-                "roomId": roomId,
-                "partnerId": partnerId,
-                "isPartnerGuest": partnerIsGuest
-            }
+            # CRITICAL: Verify partner is different from current user
+            if partnerId == userId:
+                logger.warning(f"⚠️ Skip On: User {userId} matched with themselves in room {roomId}, cleaning up")
+                # Invalid room - user matched with themselves, clean up
+                del skip_active_rooms[roomId]
+                del skip_user_to_room[userId]
+                if partnerId in skip_user_to_room:
+                    del skip_user_to_room[partnerId]
+                # Continue to normal matchmaking flow
+            else:
+                logger.info(f"✅ Skip On: User {userId} already in room {roomId} with partner {partnerId}")
+                logger.info(f"✅ Skip On: Returning matched response for existing room")
+                
+                return {
+                    "status": "matched",
+                    "roomId": roomId,
+                    "partnerId": partnerId,
+                    "isPartnerGuest": partnerIsGuest
+                }
         else:
             # Room doesn't exist, clean up
             del skip_user_to_room[userId]
     
-    # Remove user from queue if they're there (they shouldn't be if they're in a room)
-    skip_matchmaking_queue[:] = [u for u in skip_matchmaking_queue if u['userId'] != userId]
-    
-    # Check if there's someone waiting BEFORE removing ourselves
+    # IMPORTANT: Check if there's someone waiting BEFORE removing ourselves
     # This prevents race conditions where both users call match() simultaneously
-    if len(skip_matchmaking_queue) > 0:
-        # Check if we're already in the queue - if so, don't match with ourselves
-        alreadyInQueue = any(u['userId'] == userId for u in skip_matchmaking_queue)
-        if alreadyInQueue:
-            # We're already in queue, just return searching
-            logger.info(f"🔍 Skip On: User {userId} already in queue, waiting... (queue length: {len(skip_matchmaking_queue)})")
-            logger.info(f"🔍 Skip On: Returning 'searching' status")
-            return {
-                "status": "searching"
-            }
-        # Match with first person in queue
-        partner = skip_matchmaking_queue.pop(0)
+    logger.info(f"🔍 Skip On: Queue length before check: {len(skip_matchmaking_queue)}")
+    logger.info(f"🔍 Skip On: Queue contents: {[u['userId'] for u in skip_matchmaking_queue]}")
+    logger.info(f"🔍 Skip On: Current user: {userId}")
+    
+    # Check for matches FIRST, before any queue manipulation
+    # Filter out current user from queue check (they shouldn't be there, but safety check)
+    available_partners = [u for u in skip_matchmaking_queue if u['userId'] != userId]
+    
+    if len(available_partners) > 0:
+        # Match with first available partner
+        partner = available_partners[0]
         partnerId = partner['userId']
         partnerIsGuest = partner.get('isGuest', False)
         
+        logger.info(f"🔍 Skip On: Matching {userId} with {partnerId}")
+        
         # Safety check: prevent matching with yourself
         if partnerId == userId:
-            logger.warning(f"⚠️ Skip On: Attempted to match user {userId} with themselves, re-adding to queue")
-            skip_matchmaking_queue.append({
-                "userId": userId,
-                "isGuest": isGuest,
-                "timestamp": datetime.utcnow().isoformat()
-            })
+            logger.warning(f"⚠️ Skip On: Attempted to match user {userId} with themselves, skipping")
+            # Don't create room, just return searching
             return {
                 "status": "searching"
             }
+        
+        # Remove partner from queue
+        skip_matchmaking_queue[:] = [u for u in skip_matchmaking_queue if u['userId'] != partnerId]
+        # Also remove current user from queue if they're there
+        skip_matchmaking_queue[:] = [u for u in skip_matchmaking_queue if u['userId'] != userId]
         
         # Create room
         roomId = f"skip_{uuid.uuid4()}"
@@ -912,10 +921,19 @@ async def skip_match(
         logger.info(f"✅ Skip On match: Room {roomId} - {partnerId} + {userId}")
         logger.info(f"✅ Skip On: Returning matched response")
         
+        # Get partner name if available (for guest users, use a default)
+        partnerName = "Someone"
+        if not partnerIsGuest:
+            # For authenticated users, we could fetch name from DB, but for now use ID
+            partnerName = f"User {partnerId[:8]}"
+        else:
+            partnerName = f"Guest {partnerId[:8]}"
+        
         response = {
             "status": "matched",
             "roomId": roomId,
             "partnerId": partnerId,
+            "partnerName": partnerName,
             "isPartnerGuest": partnerIsGuest
         }
         logger.info(f"✅ Skip On: Response: {response}")
@@ -934,6 +952,19 @@ async def skip_match(
             logger.info(f"🔍 Skip On: User {userId} added to queue (queue length: {len(skip_matchmaking_queue)})")
         else:
             logger.info(f"🔍 Skip On: User {userId} already in queue (queue length: {len(skip_matchmaking_queue)})")
+        
+        # Remove user from queue if they're there (cleanup stale entries)
+        # This happens AFTER we've checked for matches
+        skip_matchmaking_queue[:] = [u for u in skip_matchmaking_queue if u['userId'] != userId]
+        
+        # Re-add to queue if not already there
+        if not alreadyInQueue:
+            skip_matchmaking_queue.append({
+                "userId": userId,
+                "isGuest": isGuest,
+                "timestamp": datetime.utcnow().isoformat()
+            })
+            logger.info(f"🔍 Skip On: User {userId} added to queue (queue length: {len(skip_matchmaking_queue)})")
         
         logger.info(f"🔍 Skip On: Returning searching response")
         response = {

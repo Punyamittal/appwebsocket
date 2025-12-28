@@ -10,7 +10,7 @@ import { ENABLE_DEMO_MODE } from '../config/demo';
 // Get backend URL from environment
 let API_URL = Constants.expoConfig?.extra?.EXPO_PUBLIC_BACKEND_URL || process.env.EXPO_PUBLIC_BACKEND_URL;
 if (!API_URL) {
-  API_URL = 'http://localhost:3003';
+  API_URL = 'http://localhost:3001';
   console.warn('⚠️ No backend URL configured, using default:', API_URL);
 } else {
   console.log('✅ Backend URL configured:', API_URL);
@@ -66,8 +66,17 @@ async function makeRequest(method: string, url: string, data: any, baseConfig: a
     if (ENABLE_DEMO_MODE && isNetworkError) {
       console.log('Demo mode: Backend not available, using mock data');
       console.error(`⚠️ Backend connection failed. Make sure FastAPI server is running on ${API_URL}`);
-      console.error(`   Start with: cd backend && uvicorn server:socket_app --host 0.0.0.0 --port ${new URL(API_URL).port || 3003} --reload`);
-      return { data: null, status: 200, statusText: 'OK' };
+      console.error(`   Start with: cd backend && python -m uvicorn server:socket_app --host 0.0.0.0 --port ${new URL(API_URL).port || 3001} --reload`);
+      // Return a proper error response instead of null
+      throw {
+        response: {
+          data: { detail: 'Backend server is not available. Please ensure the FastAPI server is running.' },
+          status: 503,
+          statusText: 'Service Unavailable',
+        },
+        code: 'ERR_NETWORK',
+        message: 'Backend server is not available',
+      };
     }
     throw error;
   }

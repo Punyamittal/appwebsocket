@@ -163,23 +163,47 @@ app.post('/api/chess/create', async (req, res) => {
 // Join chess room (REST API) - SIMPLIFIED
 app.post('/api/chess/join', async (req, res) => {
   try {
+    console.log('[REST API] 📥 Join request received:', { body: req.body, headers: req.headers });
     const userId = req.body.userId || req.headers['x-user-id'] || 'anonymous';
     const { roomCode, roomId } = req.body;
+    
+    console.log('[REST API] Join params:', { userId, roomCode, roomId });
 
     let actualRoomId = roomId;
 
-    // If roomCode provided, look up roomId from Redis
+    // If roomCode provided, look up roomId from Redis or memory cache
     if (!actualRoomId && roomCode) {
       const normalizedCode = roomCode.trim();
+      
+      // First try Redis
       if (redisClient && typeof redisClient.isReady === 'function' && redisClient.isReady()) {
         try {
           actualRoomId = await redisClient.get(`chess:code:${normalizedCode}`);
         } catch (redisError) {
-          console.warn('[REST API] ⚠️ Redis lookup failed:', redisError.message);
+          // Suppress auth errors, but log others
+          if (!redisError.message?.includes('NOAUTH') && !redisError.message?.includes('ECONNREFUSED')) {
+            console.warn('[REST API] ⚠️ Redis lookup failed:', redisError.message);
+          }
+        }
+      }
+      
+      // If not in Redis, try memory cache
+      if (!actualRoomId && roomCodeCache) {
+        actualRoomId = roomCodeCache.get(normalizedCode);
+        if (actualRoomId) {
+          console.log(`[REST API] ✅ Found room code in memory cache: ${normalizedCode} -> ${actualRoomId}`);
+        } else {
+          console.log(`[REST API] ❌ Room code not found in memory cache: ${normalizedCode}`);
+          console.log(`[REST API] Memory cache size: ${roomCodeCache.size} codes, ${roomCache.size} rooms`);
+          // Log all room codes in cache for debugging
+          if (roomCodeCache.size > 0) {
+            console.log(`[REST API] Available room codes:`, Array.from(roomCodeCache.keys()).slice(0, 10));
+          }
         }
       }
       
       if (!actualRoomId) {
+        console.log(`[REST API] ❌ Room code lookup failed: ${normalizedCode}`);
         return res.status(404).json({ success: false, error: 'Invalid room code. Room may have expired or Redis is unavailable.' });
       }
     }
@@ -1221,13 +1245,25 @@ server.listen(PORT, '0.0.0.0', () => {
 // Graceful shutdown
 process.on('SIGTERM', async () => {
   console.log('\n[SERVER] SIGTERM received, shutting down...');
-  await redisClient.quit();
+  try {
+    if (redisClient && redisClient.isOpen) {
+      await redisClient.quit();
+    }
+  } catch (error) {
+    // Ignore errors if Redis is already closed
+  }
   server.close(() => process.exit(0));
 });
 
 process.on('SIGINT', async () => {
   console.log('\n[SERVER] SIGINT received, shutting down...');
-  await redisClient.quit();
+  try {
+    if (redisClient && redisClient.isOpen) {
+      await redisClient.quit();
+    }
+  } catch (error) {
+    // Ignore errors if Redis is already closed
+  }
   server.close(() => process.exit(0));
 });
 
