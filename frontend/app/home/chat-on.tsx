@@ -27,6 +27,8 @@ import TopNavigation from '../../components/TopNavigation';
 // Skip On Service (REST + Firebase, no Socket.IO)
 import skipOnService, { ChatMessage as SkipOnMessage } from '../../services/skipOnService.new';
 import skipOnRESTService from '../../services/skipOnRESTService';
+import skipOnVideoCallService from '../../services/skipOnVideoCallService';
+import VideoCallView from '../../components/VideoCallView';
 
 // Import avatar images
 const avatarImages = {
@@ -59,6 +61,15 @@ export default function ChatOnScreen() {
   const [partnerName, setPartnerName] = useState<string | null>(null);
   const [roomReady, setRoomReady] = useState(false); // True when both users are in room
   const flatListRef = useRef<FlatList>(null);
+  
+  // Video call state
+  const [isVideoCallActive, setIsVideoCallActive] = useState(false);
+  const [isIncomingCall, setIsIncomingCall] = useState(false);
+  const [incomingCallerId, setIncomingCallerId] = useState<string | null>(null);
+  const [localStream, setLocalStream] = useState<MediaStream | null>(null);
+  const [remoteStream, setRemoteStream] = useState<MediaStream | null>(null);
+  const [isVideoEnabled, setIsVideoEnabled] = useState(true);
+  const [isAudioEnabled, setIsAudioEnabled] = useState(true);
 
   // Debug: Watch for roomId changes
   useEffect(() => {
@@ -99,12 +110,15 @@ export default function ChatOnScreen() {
       
       console.log('[ChatOn] Starting chat for user:', userId);
       
+      // Set searching state IMMEDIATELY (before API call) so UI shows searching
+      // This ensures both users see "searching" even if one gets matched quickly
       setChatState('searching');
       setMessages([]);
       setRoomId(null);
       setInputMessage('');
 
       // Start chat with callbacks
+      // Note: If user is already matched, onMatched will be called and state will update to 'chatting'
       await skipOnService.startChat(
         userId,
         // onMatched - use functional updates to ensure state updates work
@@ -138,6 +152,21 @@ export default function ChatOnScreen() {
             console.log('[ChatOn] setChatState called, prevState:', prevState, 'newState: chatting');
             return 'chatting';
           });
+          
+          // FALLBACK: Set roomReady after 3 seconds if onRoomReady wasn't called
+          // This ensures users can message even if Socket.IO room join fails
+          const fallbackTimer = setTimeout(() => {
+            setRoomReady((currentReady) => {
+              if (!currentReady) {
+                console.warn('[ChatOn] ⚠️ Room ready callback not called after 3s, enabling messages anyway (fallback)');
+                return true;
+              }
+              return currentReady;
+            });
+          }, 3000);
+          
+          // Store timer so we can clear it if onRoomReady is called
+          (window as any).__chatOnFallbackTimer = fallbackTimer;
           
           // Force a re-render check
           setTimeout(() => {
@@ -177,6 +206,11 @@ export default function ChatOnScreen() {
         // onRoomReady - called when both users have joined
         () => {
           console.log('[ChatOn] ✅ Room is ready - both users joined');
+          // Clear fallback timer if it exists
+          if ((window as any).__chatOnFallbackTimer) {
+            clearTimeout((window as any).__chatOnFallbackTimer);
+            delete (window as any).__chatOnFallbackTimer;
+          }
           setRoomReady(true);
         }
       );
@@ -253,6 +287,81 @@ export default function ChatOnScreen() {
     setMessages([]);
     setInputMessage('');
     setChatState('idle');
+    setIsVideoCallActive(false);
+    skipOnVideoCallService.disconnect();
+  };
+
+  /**
+   * Start video call
+   */
+  const handleStartVideoCall = async () => {
+    if (!roomId || !partnerId || !user) {
+      Alert.alert('Error', 'Cannot start video call');
+      return;
+    }
+
+    try {
+      const userId = user.id || user.guest_uuid || '';
+      await skipOnVideoCallService.initiateCall(roomId, userId, partnerId);
+      const localStream = skipOnVideoCallService.getLocalStream();
+      setLocalStream(localStream);
+      setIsVideoCallActive(true);
+    } catch (error: any) {
+      console.error('[ChatOn] Error starting video call:', error);
+      Alert.alert('Error', error.message || 'Failed to start video call');
+    }
+  };
+
+  /**
+   * Answer incoming call
+   */
+  const handleAnswerCall = async (accepted: boolean) => {
+    if (!roomId || !incomingCallerId || !user) {
+      return;
+    }
+
+    const userId = user.id || user.guest_uuid || '';
+    await skipOnVideoCallService.answerCall(roomId, userId, accepted);
+    
+    if (accepted) {
+      const localStream = skipOnVideoCallService.getLocalStream();
+      setLocalStream(localStream);
+      setIsVideoCallActive(true);
+    }
+    
+    setIsIncomingCall(false);
+    setIncomingCallerId(null);
+  };
+
+  /**
+   * End video call
+   */
+  const handleEndVideoCall = () => {
+    if (roomId && user) {
+      const userId = user.id || user.guest_uuid || '';
+      skipOnVideoCallService.endCall(roomId, userId);
+    }
+    setIsVideoCallActive(false);
+    setLocalStream(null);
+    setRemoteStream(null);
+  };
+
+  /**
+   * Toggle video
+   */
+  const handleToggleVideo = () => {
+    const newState = !isVideoEnabled;
+    setIsVideoEnabled(newState);
+    skipOnVideoCallService.toggleVideo(newState);
+  };
+
+  /**
+   * Toggle audio
+   */
+  const handleToggleAudio = () => {
+    const newState = !isAudioEnabled;
+    setIsAudioEnabled(newState);
+    skipOnVideoCallService.toggleAudio(newState);
   };
 
   /**
@@ -378,11 +487,63 @@ export default function ChatOnScreen() {
         <Text style={styles.headerText}>
           {partnerName || (partnerId ? `Chatting with ${partnerId.substring(0, 8)}...` : 'Chatting with someone')}
         </Text>
+        {roomReady && (
+          <TouchableOpacity 
+            style={styles.videoCallButton} 
+            onPress={handleStartVideoCall}
+            disabled={isVideoCallActive}
+          >
+            <Ionicons name="videocam" size={20} color="#FFFFFF" />
+          </TouchableOpacity>
+        )}
         <TouchableOpacity style={styles.skipButton} onPress={handleSkip}>
           <Ionicons name="play-skip-forward" size={18} color="#FFFFFF" />
           <Text style={styles.skipButtonText}>Skip</Text>
         </TouchableOpacity>
       </View>
+      
+      {/* Video Call View Overlay */}
+      {isVideoCallActive && (
+        <VideoCallView
+          localStream={localStream}
+          remoteStream={remoteStream}
+          isCallActive={isVideoCallActive}
+          isVideoEnabled={isVideoEnabled}
+          isAudioEnabled={isAudioEnabled}
+          onEndCall={handleEndVideoCall}
+          onToggleVideo={handleToggleVideo}
+          onToggleAudio={handleToggleAudio}
+          partnerName={partnerName || undefined}
+        />
+      )}
+
+      {/* Incoming Call Dialog */}
+      {isIncomingCall && (
+        <View style={styles.incomingCallOverlay}>
+          <View style={styles.incomingCallDialog}>
+            <Text style={styles.incomingCallTitle}>Incoming Video Call</Text>
+            <Text style={styles.incomingCallText}>
+              {partnerName || 'Someone'} is calling...
+            </Text>
+            <View style={styles.incomingCallButtons}>
+              <TouchableOpacity
+                style={[styles.callButton, styles.rejectButton]}
+                onPress={() => handleAnswerCall(false)}
+              >
+                <Ionicons name="call" size={24} color="#FFFFFF" />
+                <Text style={styles.callButtonText}>Decline</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[styles.callButton, styles.acceptButton]}
+                onPress={() => handleAnswerCall(true)}
+              >
+                <Ionicons name="call" size={24} color="#FFFFFF" />
+                <Text style={styles.callButtonText}>Accept</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      )}
 
       <KeyboardAvoidingView
         behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
@@ -566,6 +727,65 @@ const styles = StyleSheet.create({
     color: '#FFFFFF',
     fontSize: 14,
     fontWeight: '600',
+  },
+  videoCallButton: {
+    marginRight: 12,
+    padding: 8,
+    borderRadius: 20,
+    backgroundColor: 'rgba(74, 144, 226, 0.2)',
+  },
+  incomingCallOverlay: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    backgroundColor: 'rgba(0, 0, 0, 0.8)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    zIndex: 1000,
+  },
+  incomingCallDialog: {
+    backgroundColor: '#1A1A1A',
+    borderRadius: 20,
+    padding: 32,
+    alignItems: 'center',
+    minWidth: 280,
+  },
+  incomingCallTitle: {
+    color: '#FFFFFF',
+    fontSize: 20,
+    fontWeight: '600',
+    marginBottom: 8,
+  },
+  incomingCallText: {
+    color: '#CCCCCC',
+    fontSize: 14,
+    marginBottom: 24,
+    textAlign: 'center',
+  },
+  incomingCallButtons: {
+    flexDirection: 'row',
+    gap: 16,
+  },
+  callButton: {
+    width: 80,
+    height: 80,
+    borderRadius: 40,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  rejectButton: {
+    backgroundColor: '#d32f2f',
+  },
+  acceptButton: {
+    backgroundColor: '#4CAF50',
+  },
+  callButtonText: {
+    color: '#FFFFFF',
+    fontSize: 12,
+    marginTop: 4,
+    fontWeight: '500',
   },
   chatContainer: {
     flex: 1,

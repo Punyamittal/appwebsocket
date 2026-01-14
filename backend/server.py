@@ -23,6 +23,10 @@ from auth import create_access_token, verify_token, get_current_user, otp_store
 from db_config import init_db, close_db, get_db, get_client
 from db_indexes import create_indexes
 from query_optimizer import QueryOptimizer
+from redis_service import redis_queue_service
+from video_call_service import (
+    get_video_call, create_video_call, update_call_status, end_video_call
+)
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -57,6 +61,15 @@ sio = socketio.AsyncServer(
 
 # Create the main app
 app = FastAPI()
+
+# Add CORS middleware EARLY (before routes) - CRITICAL for frontend access
+app.add_middleware(
+    CORSMiddleware,
+    allow_credentials=True,
+    allow_origins=["*"],  # Allow all origins in development
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Create a router with the /api prefix
 api_router = APIRouter(prefix="/api")
@@ -769,10 +782,9 @@ async def get_game_rooms(authorization: Optional[str] = Header(None)):
 # Skip On Matchmaking (REST API)
 # ======================
 
-# In-memory matchmaking queue (or use Redis in production)
-skip_matchmaking_queue = []  # List of { userId, isGuest, timestamp }
-skip_active_rooms = {}  # Dict of { roomId: { user1Id, user2Id, user1IsGuest, user2IsGuest, createdAt } }
-skip_user_to_room = {}  # Dict of { userId: roomId }
+# Redis-based matchmaking queue (with in-memory fallback)
+# Note: All queue operations now use redis_queue_service
+# The service automatically falls back to in-memory if Redis is unavailable
 
 @api_router.post("/skip/match")
 async def skip_match(
@@ -793,9 +805,19 @@ async def skip_match(
     logger.info(f"🔍 Skip On: Request body: {request}")
     logger.info(f"🔍 Skip On: Authorization header: {authorization[:20] + '...' if authorization and len(authorization) > 20 else authorization}")
     
-    # Get user ID (authenticated or guest)
+    # Get user ID and gender (authenticated or guest)
     userId = None
     isGuest = False
+    userGender = None
+    
+    # Get gender from request body (required for matching)
+    if request and request.gender:
+        userGender = request.gender
+        logger.info(f"🔍 Skip On: Gender from request: {userGender}")
+    else:
+        logger.warning("🔍 Skip On: No gender provided in request - gender-based matching requires gender")
+        # Default to OTHER if not provided (for backward compatibility)
+        userGender = Gender.OTHER
     
     if authorization and authorization.startswith("Bearer "):
         # Authenticated user
@@ -805,18 +827,22 @@ async def skip_match(
             logger.info("🔍 Skip On: Detected demo guest token, skipping database lookup")
             # Don't set userId here - let it fall through to guestId check
         else:
-            # Real authenticated user - MongoDB disabled, treat as guest
-            logger.info("🔍 Skip On: Authenticated token detected but MongoDB disabled - treating as guest")
-            # Skip database lookup - MongoDB is disabled
-            # try:
-            #     user = await get_current_user(db, token)
-            #     if user:
-            #         userId = user['_id']
-            #         isGuest = user.get('is_guest', False)
-            #         logger.info(f"🔍 Skip On: Authenticated user found: {userId}")
-            # except Exception as e:
-            #     logger.error(f"🔍 Skip On: Error getting user from token: {e}")
-            # Continue to guestId check
+            # Real authenticated user - Extract user ID from JWT token (works without MongoDB)
+            try:
+                payload = verify_token(token)
+                if payload:
+                    token_user_id = payload.get("sub")
+                    if token_user_id:
+                        userId = token_user_id
+                        isGuest = False  # Authenticated users are not guests
+                        logger.info(f"🔍 Skip On: Authenticated user ID from token: {userId}")
+                    else:
+                        logger.warning("🔍 Skip On: Token payload missing 'sub' field")
+                else:
+                    logger.warning("🔍 Skip On: Invalid token, treating as guest")
+            except Exception as e:
+                logger.error(f"🔍 Skip On: Error decoding token: {e}")
+                # Continue to guestId check if token decode fails
     
     # If no auth token or invalid, check for guestId in request body
     if not userId:
@@ -826,11 +852,13 @@ async def skip_match(
             isGuest = True
             logger.info(f"🔍 Skip On: Using guestId from request: {userId}")
         elif request is None or (request and not request.guestId):
-            # Empty body or no guestId - generate a temporary guest ID for this session
-            # This allows the frontend to work even if guestId isn't set yet
-            userId = f"temp_guest_{uuid.uuid4()}"
-            isGuest = True
-            logger.info(f"🔍 Skip On: Generated temporary guest ID: {userId}")
+            # Empty body or no guestId - DON'T generate temp_guest IDs
+            # This causes fake matches. Require proper guestId or authentication.
+            logger.error("🔍 Skip On: No userId, no guestId, and no valid token - cannot match")
+            raise HTTPException(
+                status_code=400, 
+                detail="Authentication required or guestId must be provided. Cannot create temporary guest IDs for matching."
+            )
         else:
             logger.error("🔍 Skip On: No userId and no guestId provided")
             raise HTTPException(status_code=400, detail="Authentication required or guestId must be provided")
@@ -841,149 +869,261 @@ async def skip_match(
         logger.error("🔍 Skip On: No userId after processing, returning error")
         raise HTTPException(status_code=400, detail="Unable to determine user ID")
     
-    # IMPORTANT: Check if user is already in a room (matched by another user's request)
-    # This handles the case where User 1 is in queue, User 2 calls match() and gets matched,
-    # but User 1 is still polling and needs to know they're matched
-    if userId in skip_user_to_room:
-        roomId = skip_user_to_room[userId]
-        if roomId in skip_active_rooms:
-            room = skip_active_rooms[roomId]
-            # Get partner ID
-            partnerId = room['user1Id'] if room['user1Id'] != userId else room['user2Id']
-            partnerIsGuest = room['user1IsGuest'] if room['user1Id'] != userId else room['user2IsGuest']
+    # CRITICAL: Check if user is already in a room FIRST (before checking queue)
+    # This handles the case where:
+    # - User A matches with User B and creates room
+    # - User B calls match() (via polling) and should find they're already in that room
+    # - Both users should get the SAME roomId
+    existing_room_id = await redis_queue_service.get_user_room(userId)
+    if existing_room_id:
+        room = await redis_queue_service.get_room(existing_room_id)
+        if room:
+            user1 = room.get('user1Id')
+            user2 = room.get('user2Id')
             
-            # CRITICAL: Verify partner is different from current user
-            if partnerId == userId:
-                logger.warning(f"⚠️ Skip On: User {userId} matched with themselves in room {roomId}, cleaning up")
-                # Invalid room - user matched with themselves, clean up
-                del skip_active_rooms[roomId]
-                del skip_user_to_room[userId]
-                if partnerId in skip_user_to_room:
-                    del skip_user_to_room[partnerId]
-                # Continue to normal matchmaking flow
-            else:
-                logger.info(f"✅ Skip On: User {userId} already in room {roomId} with partner {partnerId}")
-                logger.info(f"✅ Skip On: Returning matched response for existing room")
+            # CRITICAL: Only return matched if BOTH users exist and are different
+            if user1 and user2 and user1 != user2:
+                # Both users exist - get partner ID
+                partnerId = user1 if user1 != userId else user2
                 
-                return {
-                    "status": "matched",
-                    "roomId": roomId,
-                    "partnerId": partnerId,
-                    "isPartnerGuest": partnerIsGuest
-                }
+                # CRITICAL: Verify partner is different from current user AND partnerId is valid
+                if partnerId and partnerId != userId and partnerId.strip() != '':
+                    partnerIsGuest = room.get('user1IsGuest', False) if user1 != userId else room.get('user2IsGuest', False)
+                    logger.info(f"✅ Skip On: User {userId} already in matched room {existing_room_id} with partner {partnerId}")
+                    logger.info(f"✅ Skip On: Returning matched response for existing room")
+                    
+                    return {
+                        "status": "matched",
+                        "roomId": existing_room_id,
+                        "partnerId": partnerId,  # MUST be present and valid
+                        "isPartnerGuest": partnerIsGuest
+                    }
+                else:
+                    logger.error(f"❌ Skip On: Invalid partnerId ({partnerId}) in existing room {existing_room_id} for user {userId}")
+                    await redis_queue_service.delete_room(existing_room_id)
+                    return {"status": "searching"}
+            else:
+                # Single-user room or invalid state detected! Clean it up and continue searching
+                logger.warning(f"⚠️ Skip On: User {userId} in single-user or invalid room {existing_room_id} (user1: {user1}, user2: {user2}), cleaning up")
+                await redis_queue_service.delete_room(existing_room_id)
+                # Continue to normal matchmaking flow
         else:
-            # Room doesn't exist, clean up
-            del skip_user_to_room[userId]
+            # Room doesn't exist, already cleaned up
+            pass
     
-    # IMPORTANT: Check if there's someone waiting BEFORE removing ourselves
-    # This prevents race conditions where both users call match() simultaneously
-    logger.info(f"🔍 Skip On: Queue length before check: {len(skip_matchmaking_queue)}")
-    logger.info(f"🔍 Skip On: Queue contents: {[u['userId'] for u in skip_matchmaking_queue]}")
-    logger.info(f"🔍 Skip On: Current user: {userId}")
+    # CRITICAL: First, ensure current user is in queue (if not already)
+    # This ensures that when another user searches, they can find us
+    alreadyInQueue = await redis_queue_service.is_user_in_queue(userId)
+    if not alreadyInQueue:
+        timestamp = datetime.utcnow().isoformat()
+        await redis_queue_service.add_to_queue(userId, isGuest, userGender, timestamp)
+        logger.info(f"🔍 Skip On: User {userId} (gender: {userGender}) added to queue")
     
-    # FIRST: Check for existing rooms with only one user (waiting for a partner)
-    # This handles the case where a room was created but the second user never joined
-    waiting_room = None
-    waiting_room_id = None
-    waiting_user_id = None
-    waiting_user_is_guest = False
+    queue_length = await redis_queue_service.get_queue_length()
+    logger.info(f"🔍 Skip On: Queue length: {queue_length}")
+    logger.info(f"🔍 Skip On: Current user: {userId} (gender: {userGender})")
+    logger.info(f"🔍 Skip On: Current user isGuest: {isGuest}")
+    logger.info(f"🔍 Skip On: Redis connected: {redis_queue_service.is_connected}, Fallback mode: {redis_queue_service.fallback_mode}")
     
-    for room_id, room_data in skip_active_rooms.items():
-        # Check if room has only one user (waiting for partner)
-        user1 = room_data.get('user1Id')
-        user2 = room_data.get('user2Id')
-        
-        # Room is waiting if it has user1 but no user2, or vice versa
-        if user1 and not user2:
-            waiting_room = room_data
-            waiting_room_id = room_id
-            waiting_user_id = user1
-            waiting_user_is_guest = room_data.get('user1IsGuest', False)
-            logger.info(f"🔍 Skip On: Found waiting room {room_id} with user {user1}")
-            break
-        elif user2 and not user1:
-            waiting_room = room_data
-            waiting_room_id = room_id
-            waiting_user_id = user2
-            waiting_user_is_guest = room_data.get('user2IsGuest', False)
-            logger.info(f"🔍 Skip On: Found waiting room {room_id} with user {user2}")
-            break
+    # Get compatible partners from Redis (automatically filters by gender compatibility)
+    # This will find users who are already in the queue
+    available_partners = await redis_queue_service.get_compatible_partners(userId, userGender)
     
-    # If we found a waiting room, match the new user to it
-    if waiting_room and waiting_user_id and waiting_user_id != userId:
-        logger.info(f"🔍 Skip On: Matching {userId} to existing waiting room {waiting_room_id} with user {waiting_user_id}")
-        
-        # Update the room to include the second user
-        if not waiting_room.get('user1Id'):
-            waiting_room['user1Id'] = userId
-            waiting_room['user1IsGuest'] = isGuest
-        elif not waiting_room.get('user2Id'):
-            waiting_room['user2Id'] = userId
-            waiting_room['user2IsGuest'] = isGuest
-        
-        # Update mappings
-        skip_user_to_room[userId] = waiting_room_id
-        skip_active_rooms[waiting_room_id] = waiting_room
-        
-        # Remove from queue if present
-        skip_matchmaking_queue[:] = [u for u in skip_matchmaking_queue if u['userId'] != userId]
-        skip_matchmaking_queue[:] = [u for u in skip_matchmaking_queue if u['userId'] != waiting_user_id]
-        
-        logger.info(f"✅ Skip On match: User {userId} joined existing room {waiting_room_id} with {waiting_user_id}")
-        
-        # Get partner name
-        partnerName = "Someone"
-        if not waiting_user_is_guest:
-            partnerName = f"User {waiting_user_id[:8]}"
-        else:
-            partnerName = f"Guest {waiting_user_id[:8]}"
-        
-        return {
-            "status": "matched",
-            "roomId": waiting_room_id,
-            "partnerId": waiting_user_id,
-            "partnerName": partnerName,
-            "isPartnerGuest": waiting_user_is_guest
-        }
-    
-    # Check for matches in queue FIRST, before any queue manipulation
-    # Filter out current user from queue check (they shouldn't be there, but safety check)
-    available_partners = [u for u in skip_matchmaking_queue if u['userId'] != userId]
+    logger.info(f"🔍 Skip On: Available compatible partners: {len(available_partners)} (user gender: {userGender})")
+    if available_partners:
+        logger.info(f"🔍 Skip On: Compatible partner IDs: {[p.get('userId') for p in available_partners]}")
+        logger.info(f"🔍 Skip On: Partner details: {available_partners}")
+    else:
+        logger.info(f"🔍 Skip On: No compatible partners found in queue (user gender: {userGender})")
+        logger.info(f"🔍 Skip On: Queue length: {queue_length}, User in queue: {alreadyInQueue}")
     
     if len(available_partners) > 0:
         # Match with first available partner
         partner = available_partners[0]
-        partnerId = partner['userId']
+        partnerId = partner.get('userId')
         partnerIsGuest = partner.get('isGuest', False)
+        partnerGender_str = partner.get('gender', 'other')
+        
+        # CRITICAL: Prevent matching with temp_guest IDs (they're fake, not real users)
+        if partnerId and (partnerId.startswith('temp_guest_') or userId.startswith('temp_guest_')):
+            logger.warning(f"⚠️ Skip On: Attempted to match with temp_guest ID (fake user), skipping")
+            logger.warning(f"⚠️ Skip On: partnerId: {partnerId}, userId: {userId}")
+            # Don't create room, just return searching
+            return {
+                "status": "searching"
+            }
+        
+        if not partnerId:
+            logger.warning(f"⚠️ Skip On: Partner data missing userId, skipping")
+            return {"status": "searching"}
         
         logger.info(f"🔍 Skip On: Matching {userId} with {partnerId}")
         
         # Safety check: prevent matching with yourself
         if partnerId == userId:
             logger.warning(f"⚠️ Skip On: Attempted to match user {userId} with themselves, skipping")
-            # Don't create room, just return searching
-            return {
-                "status": "searching"
-            }
+            return {"status": "searching"}
         
-        # Remove partner from queue
-        skip_matchmaking_queue[:] = [u for u in skip_matchmaking_queue if u['userId'] != partnerId]
-        # Also remove current user from queue if they're there
-        skip_matchmaking_queue[:] = [u for u in skip_matchmaking_queue if u['userId'] != userId]
+        # CRITICAL RACE CONDITION FIX: Use atomic "claim partner" operation
+        # Try to atomically claim the partner before matching
+        # This ensures only one user can match with a partner at a time
+        partner_claimed = await redis_queue_service.claim_partner_for_matching(userId, partnerId)
+        if not partner_claimed:
+            logger.warning(f"⚠️ Skip On: Partner {partnerId} was already claimed by another request, skipping match")
+            # Partner was already matched by someone else - continue searching
+            if not await redis_queue_service.is_user_in_queue(userId):
+                timestamp = datetime.utcnow().isoformat()
+                await redis_queue_service.add_to_queue(userId, isGuest, userGender, timestamp)
+            return {"status": "searching"}
         
-        # Create room
+        # Partner was successfully claimed - check if they're already in a room with us
+        partner_room = await redis_queue_service.get_user_room(partnerId)
+        if partner_room:
+            partner_room_data = await redis_queue_service.get_room(partner_room)
+            if partner_room_data:
+                room_user1 = partner_room_data.get('user1Id')
+                room_user2 = partner_room_data.get('user2Id')
+                # If partner is in a room with us, return that room
+                if (room_user1 == userId or room_user2 == userId) and room_user1 and room_user2:
+                    # Release the claim since we're using existing room
+                    await redis_queue_service.release_partner_claim(partnerId)
+                    if not partnerId or partnerId == userId or partnerId.strip() == '':
+                        logger.error(f"❌ Skip On: Invalid partnerId ({partnerId}) when partner already in room {partner_room}")
+                        return {"status": "searching"}
+                    
+                    logger.info(f"✅ Skip On: Partner {partnerId} already matched with us in room {partner_room}")
+                    partnerIsGuest = partner_room_data.get('user1IsGuest', False) if room_user1 != userId else partner_room_data.get('user2IsGuest', False)
+                    return {
+                        "status": "matched",
+                        "roomId": partner_room,
+                        "partnerId": partnerId,
+                        "isPartnerGuest": partnerIsGuest
+                    }
+                else:
+                    # Partner matched with someone else - release claim and skip
+                    await redis_queue_service.release_partner_claim(partnerId)
+                    logger.warning(f"⚠️ Skip On: Partner {partnerId} already matched with someone else, skipping")
+                    if not await redis_queue_service.is_user_in_queue(userId):
+                        timestamp = datetime.utcnow().isoformat()
+                        await redis_queue_service.add_to_queue(userId, isGuest, userGender, timestamp)
+                    return {"status": "searching"}
+        
+        # Remove current user from queue (partner is already removed by claim operation)
+        await redis_queue_service.remove_from_queue(userId)
+        
+        # CRITICAL: Double-check partner is not already in a different room
+        # This prevents creating duplicate rooms if partner was matched by another request
+        partner_room_check = await redis_queue_service.get_user_room(partnerId)
+        if partner_room_check:
+            # Partner is already in a room - check if it's with us
+            partner_room_data = await redis_queue_service.get_room(partner_room_check)
+            if partner_room_data:
+                room_user1 = partner_room_data.get('user1Id')
+                room_user2 = partner_room_data.get('user2Id')
+                if (room_user1 == userId or room_user2 == userId) and room_user1 and room_user2:
+                    # Partner is in a room with us - use that room!
+                    logger.info(f"✅ Skip On: Partner {partnerId} already in room {partner_room_check} with us, using existing room")
+                    await redis_queue_service.release_partner_claim(partnerId)
+                    partnerIsGuest = partner_room_data.get('user1IsGuest', False) if room_user1 != userId else partner_room_data.get('user2IsGuest', False)
+                    return {
+                        "status": "matched",
+                        "roomId": partner_room_check,
+                        "partnerId": partnerId,
+                        "isPartnerGuest": partnerIsGuest
+                    }
+                else:
+                    # Partner is in a room with someone else
+                    logger.warning(f"⚠️ Skip On: Partner {partnerId} is already in room {partner_room_check} with someone else, releasing claim")
+                    await redis_queue_service.release_partner_claim(partnerId)
+                    timestamp = datetime.utcnow().isoformat()
+                    await redis_queue_service.add_to_queue(userId, isGuest, userGender, timestamp)
+                    return {"status": "searching"}
+        
+        # Create room (only when both users are ready - no single-user rooms)
         roomId = f"skip_{uuid.uuid4()}"
-        skip_active_rooms[roomId] = {
-            "user1Id": partnerId,
-            "user2Id": userId,
-            "user1IsGuest": partnerIsGuest,
-            "user2IsGuest": isGuest,
-            "createdAt": datetime.utcnow().isoformat()
-        }
-        skip_user_to_room[partnerId] = roomId
-        skip_user_to_room[userId] = roomId
+        partnerGender = Gender(partnerGender_str) if isinstance(partnerGender_str, str) else partnerGender_str
+        
+        # CRITICAL: Create room atomically - both users must be added together
+        room_created = await redis_queue_service.create_room(
+            roomId=roomId,
+            user1Id=partnerId,
+            user2Id=userId,
+            user1IsGuest=partnerIsGuest,
+            user2IsGuest=isGuest,
+            user1Gender=partnerGender,
+            user2Gender=userGender
+        )
+        
+        if not room_created:
+            logger.error(f"❌ Skip On: Failed to create room {roomId}, releasing claim and re-adding users to queue")
+            await redis_queue_service.release_partner_claim(partnerId)
+            # Re-add both users to queue if room creation failed
+            timestamp = datetime.utcnow().isoformat()
+            await redis_queue_service.add_to_queue(userId, isGuest, userGender, timestamp)
+            await redis_queue_service.add_to_queue(partnerId, partnerIsGuest, partnerGender, timestamp)
+            return {"status": "searching"}
+        
+        # Room created successfully - release the claim
+        await redis_queue_service.release_partner_claim(partnerId)
+        
+        # CRITICAL: Verify both users are mapped to the same room
+        user_room = await redis_queue_service.get_user_room(userId)
+        partner_room = await redis_queue_service.get_user_room(partnerId)
+        if user_room != roomId or partner_room != roomId:
+            logger.error(f"❌ Skip On: Room mapping mismatch! User {userId} -> {user_room}, Partner {partnerId} -> {partner_room}, Expected: {roomId}")
+            # Fix the mapping by re-creating the room mappings
+            if not redis_queue_service.fallback_mode and redis_queue_service.redis_client:
+                try:
+                    if user_room != roomId:
+                        await redis_queue_service.redis_client.setex(f"skipon:user_room:{userId}", 3600, roomId)
+                    if partner_room != roomId:
+                        await redis_queue_service.redis_client.setex(f"skipon:user_room:{partnerId}", 3600, roomId)
+                    logger.info(f"✅ Skip On: Fixed room mappings")
+                except Exception as e:
+                    logger.error(f"❌ Skip On: Error fixing room mappings: {e}")
+            elif redis_queue_service.fallback_mode:
+                # In fallback mode, fix in-memory mappings
+                redis_queue_service.fallback_user_to_room[userId] = roomId
+                redis_queue_service.fallback_user_to_room[partnerId] = roomId
+                logger.info(f"✅ Skip On: Fixed room mappings (fallback mode)")
         
         logger.info(f"✅ Skip On match: Room {roomId} - {partnerId} + {userId}")
+        logger.info(f"✅ Skip On: User {userId} mapped to room {await redis_queue_service.get_user_room(userId)}")
+        logger.info(f"✅ Skip On: Partner {partnerId} mapped to room {await redis_queue_service.get_user_room(partnerId)}")
+        
+        # CRITICAL: Verify room was created correctly with BOTH users before returning matched
+        verify_room = await redis_queue_service.get_room(roomId)
+        if not verify_room:
+            logger.error(f"❌ Skip On: Room {roomId} was not created! Re-adding users to queue")
+            timestamp = datetime.utcnow().isoformat()
+            await redis_queue_service.add_to_queue(userId, isGuest, userGender, timestamp)
+            await redis_queue_service.add_to_queue(partnerId, partnerIsGuest, partnerGender, timestamp)
+            return {"status": "searching"}
+        
+        verify_user1 = verify_room.get('user1Id')
+        verify_user2 = verify_room.get('user2Id')
+        if not verify_user1 or not verify_user2 or verify_user1 == verify_user2:
+            logger.error(f"❌ Skip On: Room {roomId} is invalid (user1: {verify_user1}, user2: {verify_user2})! Re-adding users to queue")
+            await redis_queue_service.delete_room(roomId)
+            timestamp = datetime.utcnow().isoformat()
+            await redis_queue_service.add_to_queue(userId, isGuest, userGender, timestamp)
+            await redis_queue_service.add_to_queue(partnerId, partnerIsGuest, partnerGender, timestamp)
+            return {"status": "searching"}
+        
+        # CRITICAL: Only return "matched" if room has BOTH users confirmed
+        # DOUBLE-CHECK: Verify partnerId is valid and different from userId
+        if not partnerId or partnerId == userId or partnerId.strip() == '':
+            logger.error(f"❌ Skip On: Invalid partnerId ({partnerId}) for user {userId}! Re-adding to queue")
+            await redis_queue_service.delete_room(roomId)
+            timestamp = datetime.utcnow().isoformat()
+            await redis_queue_service.add_to_queue(userId, isGuest, userGender, timestamp)
+            actual_partner = verify_user1 if verify_user1 != userId else verify_user2
+            if actual_partner:
+                await redis_queue_service.add_to_queue(actual_partner, partnerIsGuest, partnerGender, timestamp)
+            return {"status": "searching"}
+        
+        logger.info(f"✅ Skip On: Room {roomId} verified - both users present ({verify_user1} + {verify_user2})")
+        logger.info(f"✅ Skip On: Partner ID confirmed: {partnerId} (different from userId: {userId})")
         logger.info(f"✅ Skip On: Returning matched response")
         
         # Get partner name if available (for guest users, use a default)
@@ -994,47 +1134,63 @@ async def skip_match(
         else:
             partnerName = f"Guest {partnerId[:8]}"
         
+        # CRITICAL: Ensure partnerId is included in response
         response = {
             "status": "matched",
             "roomId": roomId,
-            "partnerId": partnerId,
+            "partnerId": partnerId,  # MUST be present for frontend to create Firebase room
             "partnerName": partnerName,
             "isPartnerGuest": partnerIsGuest
         }
         logger.info(f"✅ Skip On: Response: {response}")
+        logger.info(f"✅ Skip On: Response includes partnerId: {partnerId is not None and partnerId != ''}")
         return response
     else:
-        # No one waiting in queue and no waiting rooms
+        # No one waiting in queue
         # Check if we're already in queue
-        alreadyInQueue = any(u['userId'] == userId for u in skip_matchmaking_queue)
+        alreadyInQueue = await redis_queue_service.is_user_in_queue(userId)
         
-        # Check if user already has a room (waiting for partner)
-        user_has_waiting_room = userId in skip_user_to_room
-        if user_has_waiting_room:
-            existing_room_id = skip_user_to_room[userId]
-            if existing_room_id in skip_active_rooms:
-                existing_room = skip_active_rooms[existing_room_id]
-                # Check if room only has one user (waiting for partner)
+        # Check if user already has a room (should only happen if matched)
+        # CRITICAL: Only return "matched" if BOTH users are in the room
+        existing_room_id = await redis_queue_service.get_user_room(userId)
+        if existing_room_id:
+            existing_room = await redis_queue_service.get_room(existing_room_id)
+            if existing_room:
+                # Check if room has both users (matched)
                 user1 = existing_room.get('user1Id')
                 user2 = existing_room.get('user2Id')
-                if (user1 == userId and not user2) or (user2 == userId and not user1):
-                    logger.info(f"🔍 Skip On: User {userId} already has waiting room {existing_room_id}, returning searching")
-                    return {
-                        "status": "searching"
-                    }
+                
+                # CRITICAL: Only return matched if BOTH users exist and are different
+                if user1 and user2 and user1 != user2:
+                    # Verify partner is different from current user
+                    partnerId = user1 if user1 != userId else user2
+                    # CRITICAL: Verify partnerId is valid (not empty, not same as userId)
+                    if partnerId and partnerId != userId and partnerId.strip() != '':
+                        partnerIsGuest = existing_room.get('user1IsGuest', False) if user1 != userId else existing_room.get('user2IsGuest', False)
+                        logger.info(f"✅ Skip On: User {userId} already in matched room {existing_room_id} with {partnerId}")
+                        return {
+                            "status": "matched",
+                            "roomId": existing_room_id,
+                            "partnerId": partnerId,  # MUST be present and valid
+                            "isPartnerGuest": partnerIsGuest
+                        }
+                    else:
+                        logger.error(f"❌ Skip On: Invalid partnerId ({partnerId}) in room check for user {userId}")
+                        await redis_queue_service.delete_room(existing_room_id)
+                        return {"status": "searching"}
+                else:
+                    # Single-user room or invalid state - clean up and continue searching
+                    logger.warning(f"⚠️ Skip On: User {userId} in single-user or invalid room {existing_room_id} (user1: {user1}, user2: {user2}), cleaning up")
+                    await redis_queue_service.delete_room(existing_room_id)
         
-        if not alreadyInQueue:
-            # Add to queue
-            skip_matchmaking_queue.append({
-                "userId": userId,
-                "isGuest": isGuest,
-                "timestamp": datetime.utcnow().isoformat()
-            })
-            logger.info(f"🔍 Skip On: User {userId} added to queue (queue length: {len(skip_matchmaking_queue)})")
-        else:
-            logger.info(f"🔍 Skip On: User {userId} already in queue (queue length: {len(skip_matchmaking_queue)})")
+        # User is already in queue (we added them at the start if they weren't)
+        queue_length = await redis_queue_service.get_queue_length()
+        logger.info(f"🔍 Skip On: User {userId} in queue, waiting for match (queue length: {queue_length})")
         
-        logger.info(f"🔍 Skip On: Returning searching response")
+        # CRITICAL: Always return "searching" - this allows multiple users to search simultaneously
+        # The backend is async and can handle concurrent requests from multiple browsers
+        logger.info(f"🔍 Skip On: Returning searching response for user {userId}")
+        logger.info(f"🔍 Skip On: Redis status - Connected: {redis_queue_service.is_connected}, Fallback: {redis_queue_service.fallback_mode}")
         response = {
             "status": "searching"
         }
@@ -1057,9 +1213,17 @@ async def skip_leave(
     
     if authorization and authorization.startswith("Bearer "):
         token = authorization.split(" ")[1]
-        user = await get_current_user(db, token)
-        if user:
-            userId = user['_id']
+        # Extract user ID from token directly (works without MongoDB)
+        try:
+            payload = verify_token(token)
+            if payload:
+                token_user_id = payload.get("sub")
+                if token_user_id:
+                    userId = token_user_id
+                    logger.info(f"🔍 Skip On: Leave - Authenticated user ID from token: {userId}")
+        except Exception as e:
+            logger.warning(f"🔍 Skip On: Leave - Error decoding token: {e}")
+            # Continue to guestId check if token decode fails
     
     # If no auth, check for guestId in request body
     if not userId:
@@ -1073,26 +1237,31 @@ async def skip_leave(
         else:
             raise HTTPException(status_code=400, detail="Authentication required or guestId must be provided")
     
-    # Remove from queue
-    skip_matchmaking_queue[:] = [u for u in skip_matchmaking_queue if u['userId'] != userId]
+    # Remove from queue (with error handling)
+    try:
+        await redis_queue_service.remove_from_queue(userId)
+    except Exception as e:
+        logger.warning(f"⚠️ Skip On: Error removing from queue: {e}")
+        # Continue anyway - not critical
     
-    # Remove from room if in one
-    if userId in skip_user_to_room:
-        roomId = skip_user_to_room[userId]
-        if roomId in skip_active_rooms:
-            room = skip_active_rooms[roomId]
-            # Get partner ID
-            partnerId = room['user1Id'] if room['user1Id'] != userId else room['user2Id']
-            
-            # Clean up room
-            del skip_active_rooms[roomId]
-            if partnerId in skip_user_to_room:
-                del skip_user_to_room[partnerId]
-            del skip_user_to_room[userId]
-            
-            logger.info(f"🚪 Skip On: User {userId} left room {roomId}, partner {partnerId} notified")
-        else:
-            del skip_user_to_room[userId]
+    # Remove from room if in one (with error handling)
+    try:
+        roomId = await redis_queue_service.get_user_room(userId)
+        if roomId:
+            room = await redis_queue_service.get_room(roomId)
+            if room:
+                # Get partner ID
+                user1Id = room.get('user1Id')
+                user2Id = room.get('user2Id')
+                partnerId = user1Id if user1Id != userId else user2Id
+                
+                # Clean up room
+                await redis_queue_service.delete_room(roomId)
+                
+                logger.info(f"🚪 Skip On: User {userId} left room {roomId}, partner {partnerId} notified")
+    except Exception as e:
+        logger.warning(f"⚠️ Skip On: Error removing from room: {e}")
+        # Continue anyway - not critical
     
     return {"status": "left"}
 
@@ -1122,16 +1291,18 @@ async def skip_status(
         return {"status": "idle"}
     
     # Check if in queue
-    inQueue = any(u['userId'] == userId for u in skip_matchmaking_queue)
+    inQueue = await redis_queue_service.is_user_in_queue(userId)
     if inQueue:
         return {"status": "searching"}
     
     # Check if in room
-    if userId in skip_user_to_room:
-        roomId = skip_user_to_room[userId]
-        if roomId in skip_active_rooms:
-            room = skip_active_rooms[roomId]
-            partnerId = room['user1Id'] if room['user1Id'] != userId else room['user2Id']
+    roomId = await redis_queue_service.get_user_room(userId)
+    if roomId:
+        room = await redis_queue_service.get_room(roomId)
+        if room:
+            user1Id = room.get('user1Id')
+            user2Id = room.get('user2Id')
+            partnerId = user1Id if user1Id != userId else user2Id
             return {
                 "status": "matched",
                 "roomId": roomId,
@@ -1140,17 +1311,266 @@ async def skip_status(
     
     return {"status": "idle"}
 
+# ======================
+# Video Call Socket Events (SkipOn)
+# ======================
+@sio.event
+async def skipon_video_call_initiate(sid, data):
+    """Initiate a video call in SkipOn room"""
+    room_id = data.get('roomId')
+    caller_id = data.get('callerId')
+    callee_id = data.get('calleeId')
+    
+    if not room_id or not caller_id or not callee_id:
+        await sio.emit('video_call_error', {'message': 'Missing required fields'}, room=sid)
+        return
+    
+    # Create video call
+    call_data = create_video_call(room_id, caller_id, callee_id)
+    
+    # Join room for signaling
+    await sio.enter_room(sid, f"skipon_video_{room_id}")
+    
+    # Notify callee
+    await sio.emit('video_call_incoming', {
+        'roomId': room_id,
+        'callerId': caller_id,
+        'callId': room_id
+    }, room=f"skipon_video_{room_id}")
+    
+    logger.info(f"📹 Video call initiated: Room {room_id}, Caller: {caller_id}")
+
+@sio.event
+async def skipon_video_call_answer(sid, data):
+    """Answer an incoming video call"""
+    room_id = data.get('roomId')
+    answerer_id = data.get('answererId')
+    accepted = data.get('accepted', False)
+    
+    if not room_id:
+        await sio.emit('video_call_error', {'message': 'Missing roomId'}, room=sid)
+        return
+    
+    call_data = get_video_call(room_id)
+    if not call_data:
+        await sio.emit('video_call_error', {'message': 'Call not found'}, room=sid)
+        return
+    
+    if accepted:
+        update_call_status(room_id, "accepted")
+        await sio.emit('video_call_accepted', {
+            'roomId': room_id,
+            'answererId': answerer_id
+        }, room=f"skipon_video_{room_id}")
+        logger.info(f"📹 Video call accepted: Room {room_id}, Answerer: {answerer_id}")
+    else:
+        update_call_status(room_id, "rejected")
+        await sio.emit('video_call_rejected', {
+            'roomId': room_id,
+            'answererId': answerer_id
+        }, room=f"skipon_video_{room_id}")
+        end_video_call(room_id)
+        logger.info(f"📹 Video call rejected: Room {room_id}, Answerer: {answerer_id}")
+
+@sio.event
+async def skipon_video_call_offer(sid, data):
+    """Send WebRTC offer"""
+    room_id = data.get('roomId')
+    offer = data.get('offer')
+    sender_id = data.get('senderId')
+    
+    if not room_id or not offer:
+        await sio.emit('video_call_error', {'message': 'Missing offer data'}, room=sid)
+        return
+    
+    # Forward offer to other participant
+    await sio.emit('video_call_offer', {
+        'roomId': room_id,
+        'offer': offer,
+        'senderId': sender_id
+    }, room=f"skipon_video_{room_id}", skip_sid=sid)
+    
+    logger.info(f"📹 WebRTC offer sent: Room {room_id}, Sender: {sender_id}")
+
+@sio.event
+async def skipon_video_call_answer_webrtc(sid, data):
+    """Send WebRTC answer"""
+    room_id = data.get('roomId')
+    answer = data.get('answer')
+    sender_id = data.get('senderId')
+    
+    if not room_id or not answer:
+        await sio.emit('video_call_error', {'message': 'Missing answer data'}, room=sid)
+        return
+    
+    # Forward answer to other participant
+    await sio.emit('video_call_answer', {
+        'roomId': room_id,
+        'answer': answer,
+        'senderId': sender_id
+    }, room=f"skipon_video_{room_id}", skip_sid=sid)
+    
+    logger.info(f"📹 WebRTC answer sent: Room {room_id}, Sender: {sender_id}")
+
+@sio.event
+async def skipon_video_call_ice_candidate(sid, data):
+    """Send ICE candidate"""
+    room_id = data.get('roomId')
+    candidate = data.get('candidate')
+    sender_id = data.get('senderId')
+    
+    if not room_id or not candidate:
+        return
+    
+    # Forward ICE candidate to other participant
+    await sio.emit('video_call_ice_candidate', {
+        'roomId': room_id,
+        'candidate': candidate,
+        'senderId': sender_id
+    }, room=f"skipon_video_{room_id}", skip_sid=sid)
+
+@sio.event
+async def skipon_video_call_end(sid, data):
+    """End a video call"""
+    room_id = data.get('roomId')
+    user_id = data.get('userId')
+    
+    if not room_id:
+        return
+    
+    # Notify other participant
+    await sio.emit('video_call_ended', {
+        'roomId': room_id,
+        'endedBy': user_id
+    }, room=f"skipon_video_{room_id}")
+    
+    # Clean up
+    end_video_call(room_id)
+    await sio.leave_room(sid, f"skipon_video_{room_id}")
+    
+    logger.info(f"📹 Video call ended: Room {room_id}, Ended by: {user_id}")
+
+@sio.event
+async def skipon_video_call_join_room(sid, data):
+    """Join video call room for signaling"""
+    room_id = data.get('roomId')
+    if room_id:
+        await sio.enter_room(sid, f"skipon_video_{room_id}")
+        logger.info(f"📹 User joined video call room: {room_id}")
+
+@sio.event
+async def skipon_video_call_leave_room(sid, data):
+    """Leave video call room"""
+    room_id = data.get('roomId')
+    if room_id:
+        await sio.leave_room(sid, f"skipon_video_{room_id}")
+        logger.info(f"📹 User left video call room: {room_id}")
+
+# ======================
+# SkipOn Chat Socket Events (Socket.IO messaging)
+# ======================
+@sio.event
+async def skipon_join_chat_room(sid, data):
+    """Join SkipOn chat room for messaging"""
+    room_id = data.get('roomId')
+    user_id = data.get('userId')
+    
+    if not room_id or not user_id:
+        await sio.emit('skipon_error', {'message': 'Missing roomId or userId'}, room=sid)
+        return
+    
+    # Verify room exists in Redis
+    room = await redis_queue_service.get_room(room_id)
+    if not room:
+        await sio.emit('skipon_error', {'message': 'Room not found'}, room=sid)
+        logger.error(f"❌ SkipOn Chat: Room {room_id} not found for user {user_id}")
+        return
+    
+    # Verify user is part of this room
+    room_user1 = room.get('user1Id')
+    room_user2 = room.get('user2Id')
+    if user_id != room_user1 and user_id != room_user2:
+        await sio.emit('skipon_error', {'message': 'Not authorized for this room'}, room=sid)
+        logger.error(f"❌ SkipOn Chat: User {user_id} not authorized for room {room_id}")
+        return
+    
+    # Join Socket.IO room for messaging
+    await sio.enter_room(sid, f"skipon_chat_{room_id}")
+    
+    # Get partner ID
+    partner_id = room_user1 if user_id == room_user2 else room_user2
+    
+    logger.info(f"💬 SkipOn Chat: User {user_id} joined chat room {room_id}, partner: {partner_id}")
+    await sio.emit('skipon_room_joined', {
+        'roomId': room_id,
+        'partnerId': partner_id
+    }, room=sid)
+
+@sio.event
+async def skipon_send_message(sid, data):
+    """Send chat message in SkipOn room"""
+    room_id = data.get('roomId')
+    user_id = data.get('userId')
+    message = data.get('message')
+    
+    if not room_id or not user_id or not message:
+        await sio.emit('skipon_error', {'message': 'Missing required fields'}, room=sid)
+        return
+    
+    # Verify room exists
+    room = await redis_queue_service.get_room(room_id)
+    if not room:
+        await sio.emit('skipon_error', {'message': 'Room not found'}, room=sid)
+        return
+    
+    # Verify user is part of this room
+    room_user1 = room.get('user1Id')
+    room_user2 = room.get('user2Id')
+    if user_id != room_user1 and user_id != room_user2:
+        await sio.emit('skipon_error', {'message': 'Not authorized for this room'}, room=sid)
+        return
+    
+    # Prepare message data
+    message_data = {
+        'roomId': room_id,
+        'senderId': user_id,
+        'message': message.strip(),
+        'timestamp': datetime.utcnow().isoformat(),
+    }
+    
+    # Broadcast to room (excludes sender automatically via skip_sid)
+    await sio.emit('skipon_message_received', message_data, room=f"skipon_chat_{room_id}", skip_sid=sid)
+    
+    # Confirm to sender
+    await sio.emit('skipon_message_sent', {
+        'roomId': room_id,
+        'timestamp': message_data['timestamp']
+    }, room=sid)
+    
+    logger.info(f"💬 SkipOn Chat: {user_id} -> partner in room {room_id}: \"{message[:50]}{'...' if len(message) > 50 else ''}\"")
+
+@sio.event
+async def skipon_leave_chat_room(sid, data):
+    """Leave SkipOn chat room"""
+    room_id = data.get('roomId')
+    user_id = data.get('userId')
+    
+    if room_id:
+        await sio.leave_room(sid, f"skipon_chat_{room_id}")
+        
+        # Notify partner that user left
+        await sio.emit('skipon_partner_left', {
+            'roomId': room_id,
+            'userId': user_id
+        }, room=f"skipon_chat_{room_id}", skip_sid=sid)
+        
+        logger.info(f"💬 SkipOn Chat: User {user_id} left chat room {room_id}")
+
 # Include router AFTER all routes are defined
 # This ensures all routes are registered before including the router
 app.include_router(api_router)
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_credentials=True,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# CORS middleware already added above (before routes)
 
 @app.on_event("startup")
 async def startup_event():
@@ -1159,10 +1579,19 @@ async def startup_event():
     
     # MongoDB disabled - using in-memory storage only
     logger.info("⚠️ MongoDB disabled - running in memory-only mode")
-    logger.info("⚠️ Skip On matchmaking will work (uses in-memory queue)")
+    logger.info("⚠️ Skip On matchmaking will work (uses Redis queue with in-memory fallback)")
     logger.info("⚠️ Other features requiring database will not work")
     client = None
     db = None
+    
+    # Initialize Redis for SkipOn queue
+    logger.info("🔧 Initializing Redis for SkipOn matchmaking queue...")
+    redis_connected = await redis_queue_service.connect()
+    if redis_connected:
+        logger.info("✅ Redis connected - SkipOn queue will use Redis (scalable)")
+    else:
+        logger.warning("⚠️ Redis unavailable - SkipOn queue will use in-memory fallback (not scalable)")
+        logger.warning("💡 To enable Redis: docker run -d -p 6379:6379 --name redis-skipon redis:latest")
     
     # COMMENTED OUT: MongoDB initialization
     # try:
@@ -1186,7 +1615,11 @@ async def shutdown_event():
     """Close database connection on shutdown."""
     # MongoDB disabled - no cleanup needed
     # await close_db()
-    logger.info("Server shutting down (MongoDB disabled)")
+    
+    # Disconnect Redis
+    await redis_queue_service.disconnect()
+    
+    logger.info("Server shutting down (MongoDB disabled, Redis disconnected)")
 
 # Create Socket.IO ASGI app AFTER all routes and middleware are configured
 # This wraps the FastAPI app so both Socket.IO and REST API work together

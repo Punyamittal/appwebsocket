@@ -58,6 +58,7 @@ pytz==2025.2
 requests==2.32.5
 requests-oauthlib==2.0.0
 rich==14.2.0
+redis==5.0.1
 rsa==4.9.1
 s3transfer==0.16.0
 s5cmd==0.2.0

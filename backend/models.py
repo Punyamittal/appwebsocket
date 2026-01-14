@@ -195,6 +195,7 @@ class ReportCreate(BaseModel):
 # Skip On Models
 class SkipMatchRequest(BaseModel):
     guestId: Optional[str] = None  # Required for guest users
+    gender: Optional[Gender] = None  # Required for gender-based matching
 
 class SkipLeaveRequest(BaseModel):
     guestId: Optional[str] = None  # Required for guest users

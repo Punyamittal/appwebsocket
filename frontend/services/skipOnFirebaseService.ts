@@ -47,8 +47,13 @@ class SkipOnFirebaseService {
         onValue(testRef, (snapshot) => {
           const connected = snapshot.val();
           console.log(`🔌 SkipOnFirebase: Connection status: ${connected ? 'CONNECTED' : 'DISCONNECTED'}`);
+          if (!connected) {
+            console.warn('⚠️ SkipOnFirebase: Database connection is DISCONNECTED. Messages will not work until Firebase Realtime Database is enabled.');
+          }
         }, (error) => {
           console.error('❌ SkipOnFirebase: Connection test error:', error);
+          console.error('❌ SkipOnFirebase: This usually means Firebase Realtime Database is not enabled.');
+          console.error('❌ SkipOnFirebase: Please enable it in Firebase Console (see FIX_FIREBASE_DATABASE.md)');
         });
       } else {
         console.warn('⚠️ SkipOnFirebaseService: Firebase app not initialized');
@@ -65,6 +70,14 @@ class SkipOnFirebaseService {
    */
   async initializeRoom(roomId: string, userId: string, partnerId: string): Promise<void> {
     console.log(`🏗️ SkipOnFirebase: initializeRoom called - roomId: ${roomId}, userId: ${userId}, partnerId: ${partnerId}`);
+    
+    // CRITICAL: Only create Firebase room if we have a valid partnerId
+    // This prevents creating rooms when users are not actually matched
+    if (!partnerId || partnerId.trim() === '') {
+      console.error('❌ SkipOnFirebase: Cannot initialize room - missing or empty partnerId');
+      console.error('❌ SkipOnFirebase: This means the user is not actually matched with anyone');
+      throw new Error('Cannot initialize room without a partner - user is not matched');
+    }
     
     if (!this.db) {
       console.error('❌ SkipOnFirebase: Database not initialized!');
@@ -166,7 +179,8 @@ class SkipOnFirebaseService {
     
     if (!this.db) {
       console.error('❌ SkipOnFirebase: Database not initialized');
-      throw new Error('Firebase Database not initialized');
+      const errorMsg = 'Firebase Realtime Database is not enabled. Please enable it in Firebase Console:\n1. Go to https://console.firebase.google.com/\n2. Select your project\n3. Click "Realtime Database"\n4. Click "Get started" and enable it';
+      throw new Error(errorMsg);
     }
 
     if (!roomId || !senderId || !text.trim()) {
@@ -230,6 +244,15 @@ class SkipOnFirebaseService {
       console.error(`❌ SkipOnFirebase: Error code:`, error.code);
       console.error(`❌ SkipOnFirebase: Error message:`, error.message);
       console.error(`❌ SkipOnFirebase: Error details:`, error.stack);
+      
+      // Check for connection refused errors
+      if (error.code === 'ERR_CONNECTION_REFUSED' || 
+          error.message?.includes('ERR_CONNECTION_REFUSED') ||
+          error.message?.includes('connection refused')) {
+        const friendlyError = new Error('Firebase Realtime Database is not enabled. Please enable it in Firebase Console:\n\n1. Go to https://console.firebase.google.com/\n2. Select project: gingr-13c0c\n3. Click "Realtime Database" in sidebar\n4. Click "Get started" and choose "Asia-Southeast1" region\n5. Click "Enable"\n\nSee FIX_FIREBASE_DATABASE.md for detailed instructions.');
+        throw friendlyError;
+      }
+      
       throw error;
     }
   }

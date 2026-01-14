@@ -1,16 +1,17 @@
 /**
- * Skip On Service (REST + Firebase)
+ * Skip On Service (REST + Socket.IO)
  * 
  * Architecture:
  * - Matchmaking: REST API (server-authoritative)
- * - Chat: Firebase Realtime Database
- * - NO Socket.IO
+ * - Chat: Socket.IO (real-time messaging)
+ * - NO Firebase Realtime Database
  * 
  * Works for both authenticated and guest users
  */
 
 import skipOnRESTService, { MatchResult } from './skipOnRESTService';
-import skipOnFirebaseService, { ChatMessage } from './skipOnFirebaseService';
+import { io, Socket } from 'socket.io-client';
+import Constants from 'expo-constants';
 
 export interface ChatMessageData {
   id: string;
@@ -20,15 +21,153 @@ export interface ChatMessageData {
   created_at: string;
 }
 
+// Get backend URL for Socket.IO
+const getBackendUrl = (): string => {
+  const expoExtraValue = Constants.expoConfig?.extra?.['EXPO_PUBLIC_BACKEND_URL'];
+  if (expoExtraValue && typeof expoExtraValue === 'string' && expoExtraValue.trim() !== '') {
+    return expoExtraValue.trim();
+  }
+  const envValue = process.env.EXPO_PUBLIC_BACKEND_URL;
+  if (envValue && typeof envValue === 'string' && envValue.trim() !== '') {
+    return envValue.trim();
+  }
+  return 'http://localhost:3001';
+};
+
 class SkipOnService {
   private currentRoomId: string | null = null;
   private currentUserId: string | null = null;
   private onMatchFoundCallback: ((roomId: string, partnerId?: string, partnerName?: string) => void) | null = null;
   private onMessageCallback: ((message: ChatMessageData) => void) | null = null;
   private onRoomEndedCallback: (() => void) | null = null;
-  private firebaseCleanup: (() => void) | null = null;
+  private onRoomReadyCallback: (() => void) | null = null;
+  private socket: Socket | null = null;
   private isSearching: boolean = false;
   private matchPollingInterval: NodeJS.Timeout | null = null;
+  private backendUrl: string;
+
+  constructor() {
+    this.backendUrl = getBackendUrl();
+    console.log('[SkipOn] Service initialized with Socket.IO messaging');
+    console.log('[SkipOn] Backend URL:', this.backendUrl);
+  }
+
+  /**
+   * Initialize Socket.IO connection
+   */
+  private initializeSocket(): void {
+    if (this.socket?.connected) {
+      console.log('[SkipOn] Socket already connected');
+      return;
+    }
+
+    // Close existing socket if any
+    if (this.socket) {
+      this.socket.removeAllListeners();
+      this.socket.disconnect();
+      this.socket = null;
+    }
+
+    console.log(`[SkipOn] 🔌 Connecting to Socket.IO: ${this.backendUrl}`);
+    this.socket = io(this.backendUrl, {
+      transports: ['polling', 'websocket'], // Try polling first, then upgrade to websocket
+      autoConnect: true,
+      reconnection: true,
+      reconnectionDelay: 1000,
+      reconnectionDelayMax: 5000,
+      reconnectionAttempts: 10,
+      timeout: 30000,
+      forceNew: true,
+      upgrade: true, // Allow upgrade from polling to websocket
+    });
+
+    this.setupSocketHandlers();
+  }
+
+  /**
+   * Setup Socket.IO event handlers
+   */
+  private setupSocketHandlers(): void {
+    if (!this.socket) return;
+
+    this.socket.on('connect', () => {
+      console.log('[SkipOn] ✅ Socket.IO connected');
+      console.log('[SkipOn] Socket ID:', this.socket?.id);
+    });
+
+    this.socket.on('disconnect', () => {
+      console.log('[SkipOn] Socket.IO disconnected');
+    });
+
+    this.socket.on('connect_error', (error) => {
+      console.error('[SkipOn] ❌ Socket.IO connection error:', error);
+      console.error('[SkipOn] Error type:', error.constructor.name);
+      console.error('[SkipOn] Error message:', error.message);
+      console.error('[SkipOn] Error details:', error);
+    });
+
+    // Message received from partner
+    this.socket.on('skipon_message_received', (data: {
+      roomId: string;
+      senderId: string;
+      message: string;
+      timestamp: string;
+    }) => {
+      // Only process messages for current room
+      if (data.roomId !== this.currentRoomId) {
+        console.log('[SkipOn] ⚠️ Ignoring message for different room:', data.roomId);
+        return;
+      }
+
+      // Don't process own messages
+      if (data.senderId === this.currentUserId) {
+        console.log('[SkipOn] ⚠️ Ignoring own message');
+        return;
+      }
+
+      console.log('[SkipOn] 📨 Message received from partner:', data.message.substring(0, 50));
+
+      if (this.onMessageCallback) {
+        const messageData: ChatMessageData = {
+          id: `msg_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+          sender_id: data.senderId,
+          message: data.message,
+          timestamp: data.timestamp,
+          created_at: data.timestamp,
+        };
+        this.onMessageCallback(messageData);
+      }
+    });
+
+    // Message sent confirmation
+    this.socket.on('skipon_message_sent', (data: { roomId: string; timestamp: string }) => {
+      console.log('[SkipOn] ✅ Message sent confirmation for room:', data.roomId);
+    });
+
+    // Room joined confirmation
+    this.socket.on('skipon_room_joined', (data: { roomId: string; partnerId: string }) => {
+      console.log('[SkipOn] ✅ Joined chat room:', data.roomId, 'Partner:', data.partnerId);
+      // Note: onRoomReadyCallback is now called in handleMatch after join confirmation
+      // This handler is kept for backward compatibility
+      if (this.onRoomReadyCallback && data.roomId === this.currentRoomId) {
+        console.log('[SkipOn] ✅ Calling onRoomReadyCallback from event handler');
+        this.onRoomReadyCallback();
+      }
+    });
+
+    // Partner left
+    this.socket.on('skipon_partner_left', (data: { roomId: string; userId: string }) => {
+      console.log('[SkipOn] 🚪 Partner left room:', data.roomId);
+      if (this.onRoomEndedCallback) {
+        this.onRoomEndedCallback();
+      }
+    });
+
+    // Error handler
+    this.socket.on('skipon_error', (error: { message: string }) => {
+      console.error('[SkipOn] ❌ Socket.IO error:', error.message);
+    });
+  }
 
   /**
    * Start searching for a chat partner
@@ -47,10 +186,14 @@ class SkipOnService {
       this.onMessageCallback = onMessage;
       this.onRoomEndedCallback = onPartnerLeft;
       this.onRoomReadyCallback = onRoomReady;
-      this.onRoomReadyCallback = onRoomReady;
 
       console.log('[SkipOn] Starting matchmaking for user:', clientId);
       console.log('[SkipOn] Callbacks set - onMatched:', typeof onMatched, 'onMessage:', typeof onMessage);
+
+      // CRITICAL: Set isSearching BEFORE making API call
+      // This ensures UI shows "searching" state even if request fails or user is immediately matched
+      this.isSearching = true;
+      console.log('[SkipOn] ✅ Set isSearching=true before API call');
 
       // Start matchmaking
       await this.startMatchmaking();
@@ -58,6 +201,8 @@ class SkipOnService {
     } catch (error: any) {
       const errorMsg = error.message || 'Failed to start chat';
       console.error('[SkipOn] startChat error:', errorMsg);
+      // Reset searching state on error
+      this.isSearching = false;
       if (onError) {
         onError(errorMsg);
       }
@@ -69,11 +214,14 @@ class SkipOnService {
    * Start matchmaking (polling REST API)
    */
   private async startMatchmaking(): Promise<void> {
-    if (this.isSearching) {
-      console.log('[SkipOn] Already searching, skipping');
+    // Note: isSearching is already set to true in startChat() before this is called
+    // This check prevents duplicate matchmaking attempts
+    if (this.isSearching && this.matchPollingInterval) {
+      console.log('[SkipOn] Already searching and polling, skipping');
       return;
     }
 
+    // Ensure isSearching is true (should already be set, but double-check)
     this.isSearching = true;
     console.log('[SkipOn] 🔍 Starting matchmaking, isSearching set to:', this.isSearching);
 
@@ -187,8 +335,19 @@ class SkipOnService {
     console.log('[SkipOn] Match result roomId:', result.roomId);
     
     if (result.status === 'matched' && result.roomId) {
-      // Immediate match
-      console.log('[SkipOn] ✅ Immediate match found!');
+      // CRITICAL: Only proceed if we have a valid partnerId
+      // This prevents creating Firebase rooms when users aren't actually matched
+      if (!result.partnerId || result.partnerId.trim() === '') {
+        console.error('[SkipOn] ❌ Backend returned "matched" but no partnerId - this is invalid!');
+        console.error('[SkipOn] ❌ Rejecting match - user is not actually matched with anyone');
+        console.error('[SkipOn] ❌ Result:', result);
+        // Don't create Firebase room - stay in searching mode
+        this.isSearching = true;
+        return; // Don't call handleMatch - this prevents Firebase room creation
+      }
+      
+      // Immediate match with valid partner
+      console.log('[SkipOn] ✅ Immediate match found with partner:', result.partnerId);
       this.isSearching = false;
       this.stopStatusPolling();
       await this.handleMatch(result);
@@ -196,6 +355,9 @@ class SkipOnService {
       // In queue, start polling
       console.log('[SkipOn] 🔍 In queue, waiting for match...');
       console.log('[SkipOn] isSearching is:', this.isSearching, '- will start polling');
+      // CRITICAL: Ensure isSearching stays true so polling starts
+      this.isSearching = true;
+      console.log('[SkipOn] ✅ Set isSearching to true for polling');
     } else {
       console.error('[SkipOn] ❌ Invalid match result:', result);
       throw new Error(`Invalid match result: ${JSON.stringify(result)}`);
@@ -234,87 +396,158 @@ class SkipOnService {
       console.error('[SkipOn] ❌ onMatchFoundCallback is null!');
     }
 
-    // Initialize Firebase room (non-blocking)
+    // CRITICAL: Only proceed if we have BOTH roomId AND partnerId
+    if (!result.roomId) {
+      console.error('[SkipOn] ❌ Cannot join chat room: missing roomId');
+      return;
+    }
+    
+    if (!result.partnerId) {
+      console.error('[SkipOn] ❌ Cannot join chat room: missing partnerId - not a real match');
+      return;
+    }
+    
+    // Initialize Socket.IO connection and join chat room
     try {
-      console.log('[SkipOn] Initializing Firebase room...');
+      console.log('[SkipOn] Initializing Socket.IO connection...');
+      this.initializeSocket();
+      
+      // Wait for socket to connect (increased timeout to 20 seconds)
+      if (!this.socket?.connected) {
+        console.log('[SkipOn] Waiting for socket connection...');
+        await new Promise<void>((resolve, reject) => {
+          if (!this.socket) {
+            reject(new Error('Socket not initialized'));
+            return;
+          }
+          
+          const timeout = setTimeout(() => {
+            reject(new Error('Socket connection timeout'));
+          }, 20000); // Increased from 5000 to 20000 (20 seconds)
+          
+          this.socket.once('connect', () => {
+            clearTimeout(timeout);
+            resolve();
+          });
+          
+          this.socket.once('connect_error', (error) => {
+            clearTimeout(timeout);
+            reject(error);
+          });
+        });
+      }
+      
+      // Join chat room via Socket.IO
+      console.log('[SkipOn] Joining Socket.IO chat room...');
       console.log('[SkipOn] Room ID:', result.roomId);
       console.log('[SkipOn] Current User ID:', this.currentUserId);
-      console.log('[SkipOn] Partner ID:', result.partnerId || '');
+      console.log('[SkipOn] Partner ID:', result.partnerId);
       
-      await skipOnFirebaseService.initializeRoom(
-        result.roomId,
-        this.currentUserId,
-        result.partnerId || ''
-      );
-      console.log('[SkipOn] ✅ Firebase room initialized successfully');
-    } catch (error: any) {
-      console.error('[SkipOn] ❌ Failed to initialize Firebase room:', error);
-      console.error('[SkipOn] Error details:', error.message, error.stack);
-      // Continue anyway - Firebase might work later
-    }
-
-    // Subscribe to Firebase messages
-    try {
-      console.log('[SkipOn] Subscribing to Firebase messages...');
-      this.firebaseCleanup = skipOnFirebaseService.subscribeToMessages(
-        result.roomId,
-        this.currentUserId,
-        (message: ChatMessage) => {
-          console.log('[SkipOn] 📨 Firebase message received:', message);
-          // Convert Firebase message to ChatMessageData format
-          const messageData: ChatMessageData = {
-            id: message.id,
-            sender_id: message.senderId,
-            message: message.text,
-            timestamp: new Date(message.timestamp).toISOString(),
-            created_at: new Date(message.timestamp).toISOString(),
-          };
-
-          if (this.onMessageCallback) {
-            console.log('[SkipOn] Calling onMessageCallback with:', messageData);
-            this.onMessageCallback(messageData);
-          } else {
-            console.warn('[SkipOn] ⚠️ onMessageCallback is null!');
-          }
-        },
-        () => {
-          console.log('[SkipOn] 🚪 Partner left (from Firebase)');
-          // Partner left
-          if (this.onRoomEndedCallback) {
-            this.onRoomEndedCallback();
-          }
-        },
-        () => {
-          console.log('[SkipOn] ✅ Room is ready - both users joined');
-          // Room is ready - notify callback
-          if (this.onRoomReadyCallback) {
-            this.onRoomReadyCallback();
-          }
+      // Wait a moment for socket to fully connect
+      await new Promise(resolve => setTimeout(resolve, 500));
+      
+      if (!this.socket?.connected) {
+        console.error('[SkipOn] ❌ Socket not connected, cannot join room');
+        throw new Error('Socket.IO connection failed');
+      }
+      
+      this.socket.emit('skipon_join_chat_room', {
+        roomId: result.roomId,
+        userId: this.currentUserId,
+      });
+      
+      console.log('[SkipOn] ✅ Socket.IO chat room join request sent');
+      
+      // Wait for room join confirmation with timeout
+      let roomJoined = false;
+      await new Promise<void>((resolve, reject) => {
+        if (!this.socket) {
+          console.warn('[SkipOn] ⚠️ Socket not initialized, calling callback anyway');
+          resolve();
+          return;
         }
-      );
-      console.log('[SkipOn] ✅ Firebase message subscription active');
+        
+        const timeout = setTimeout(() => {
+          console.warn('[SkipOn] ⚠️ Room join confirmation timeout - proceeding anyway');
+          // Don't reject - allow messages to be sent even if confirmation is delayed
+          resolve();
+        }, 3000); // Reduced to 3 seconds
+        
+        const onRoomJoined = (data: { roomId: string; partnerId: string }) => {
+          if (data.roomId === result.roomId) {
+            clearTimeout(timeout);
+            this.socket?.off('skipon_room_joined', onRoomJoined);
+            console.log('[SkipOn] ✅ Room join confirmed via event');
+            roomJoined = true;
+            resolve();
+          }
+        };
+        
+        const onError = (error: { message: string }) => {
+          console.error('[SkipOn] ❌ Room join error:', error.message);
+          // Don't reject - try to proceed anyway
+          clearTimeout(timeout);
+          resolve();
+        };
+        
+        this.socket.on('skipon_room_joined', onRoomJoined);
+        this.socket.on('skipon_error', onError);
+        
+        // Clean up listeners after timeout
+        setTimeout(() => {
+          this.socket?.off('skipon_room_joined', onRoomJoined);
+          this.socket?.off('skipon_error', onError);
+        }, 5000);
+      });
+      
+      // Call room ready callback - always call it, even if room join confirmation timed out
+      // This allows messages to be sent if the server processed the join but didn't send confirmation
+      if (this.onRoomReadyCallback) {
+        console.log('[SkipOn] ✅ Calling onRoomReadyCallback (roomJoined:', roomJoined, ')');
+        this.onRoomReadyCallback();
+      } else {
+        console.error('[SkipOn] ❌ onRoomReadyCallback is null!');
+      }
     } catch (error: any) {
-      console.error('[SkipOn] ❌ Failed to subscribe to Firebase messages:', error);
+      console.error('[SkipOn] ❌ Failed to initialize Socket.IO:', error);
       console.error('[SkipOn] Error details:', error.message, error.stack);
-      // Continue anyway - messages might work later
+      // Even if Socket.IO fails, call room ready callback so messages can be sent
+      // The REST API matchmaking is working, so we should allow chat to proceed
+      console.warn('[SkipOn] ⚠️ Socket.IO initialization failed, but calling onRoomReadyCallback anyway');
+      if (this.onRoomReadyCallback) {
+        // Delay a bit to let things settle
+        setTimeout(() => {
+          console.log('[SkipOn] ✅ Calling onRoomReadyCallback after Socket.IO error (fallback)');
+          this.onRoomReadyCallback!();
+        }, 1000);
+      }
     }
   }
 
   /**
-   * Send a message
+   * Send a message via Socket.IO
    */
   async sendMessage(message: string): Promise<void> {
     if (!this.currentRoomId || !this.currentUserId) {
       throw new Error('Not in a room');
     }
 
+    if (!this.socket || !this.socket.connected) {
+      throw new Error('Socket.IO not connected');
+    }
+
+    if (!message.trim()) {
+      throw new Error('Message cannot be empty');
+    }
+
     try {
-      await skipOnFirebaseService.sendMessage(
-        this.currentRoomId,
-        this.currentUserId,
-        message
-      );
-      console.log('[SkipOn] ✅ Message sent');
+      console.log('[SkipOn] 📤 Sending message via Socket.IO:', message.substring(0, 50));
+      this.socket.emit('skipon_send_message', {
+        roomId: this.currentRoomId,
+        userId: this.currentUserId,
+        message: message.trim(),
+      });
+      console.log('[SkipOn] ✅ Message sent via Socket.IO');
     } catch (error: any) {
       console.error('[SkipOn] ❌ Error sending message:', error);
       throw error;
@@ -325,12 +558,16 @@ class SkipOnService {
    * Skip current chat
    */
   async skipChat(): Promise<void> {
-    if (this.currentRoomId) {
+    // Leave Socket.IO chat room
+    if (this.currentRoomId && this.socket?.connected) {
       try {
-        // Mark room as ended in Firebase
-        await skipOnFirebaseService.endRoom(this.currentRoomId);
+        this.socket.emit('skipon_leave_chat_room', {
+          roomId: this.currentRoomId,
+          userId: this.currentUserId,
+        });
+        console.log('[SkipOn] ✅ Left Socket.IO chat room');
       } catch (error) {
-        console.error('[SkipOn] Error ending Firebase room:', error);
+        console.error('[SkipOn] Error leaving Socket.IO room:', error);
       }
     }
 
@@ -367,12 +604,24 @@ class SkipOnService {
       console.log('[SkipOn] Cleanup: Leave request failed (non-critical):', error.message || 'Server unavailable');
     });
 
-    // Cleanup Firebase
-    if (this.firebaseCleanup) {
-      this.firebaseCleanup();
-      this.firebaseCleanup = null;
+    // Leave Socket.IO chat room
+    if (this.currentRoomId && this.socket?.connected) {
+      try {
+        this.socket.emit('skipon_leave_chat_room', {
+          roomId: this.currentRoomId,
+          userId: this.currentUserId,
+        });
+      } catch (error) {
+        // Ignore errors during cleanup
+      }
     }
-    skipOnFirebaseService.cleanup();
+
+    // Disconnect Socket.IO
+    if (this.socket) {
+      this.socket.removeAllListeners();
+      this.socket.disconnect();
+      this.socket = null;
+    }
 
     // Reset state
     this.currentRoomId = null;

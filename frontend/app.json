@@ -64,6 +64,7 @@
       "EXPO_PUBLIC_FIREBASE_STORAGE_BUCKET": "gingr-13c0c.firebasestorage.app",
       "EXPO_PUBLIC_FIREBASE_MESSAGING_SENDER_ID": "471244536424",
       "EXPO_PUBLIC_FIREBASE_APP_ID": "1:471244536424:web:028901627db4e7932b99dd",
+      "EXPO_PUBLIC_FIREBASE_DATABASE_URL": "https://gingr-13c0c-default-rtdb.asia-southeast1.firebasedatabase.app/",
       "EXPO_PUBLIC_SUPABASE_URL": "https://fizsmbdgeaeqttcazhrr.supabase.co",
       "EXPO_PUBLIC_SUPABASE_ANON_KEY": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZpenNtYmRnZWFlcXR0Y2F6aHRyIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjY0Nzk5OTAsImV4cCI6MjA4MjA1NTk5MH0.tmF1E_vLLR_xxuGYnVWJsN_e7OuJI6xG_c6kZ0Tm-y0",
       "eas": {

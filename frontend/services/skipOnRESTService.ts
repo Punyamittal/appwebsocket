@@ -111,6 +111,23 @@ class SkipOnRESTService {
         body.guestId = userId;
         console.log('[SkipOnREST] Added guestId to body:', userId);
       }
+      
+      // Add gender for gender-based matching (REQUIRED - always add it)
+      const { user } = useAuthStore.getState();
+      if (user && user.gender) {
+        body.gender = user.gender;
+        console.log('[SkipOnREST] Added gender to body:', user.gender);
+      } else {
+        // Default to 'other' if gender not available (for guests or users without profile)
+        body.gender = 'other';
+        console.log('[SkipOnREST] Using default gender: other (user:', user ? 'exists but no gender' : 'null', ')');
+      }
+      
+      // CRITICAL: Ensure gender is always in body
+      if (!body.gender) {
+        body.gender = 'other';
+        console.log('[SkipOnREST] ⚠️ Gender was missing, forced to "other"');
+      }
 
       console.log('[SkipOnREST] Making POST request to /skip/match');
       console.log('[SkipOnREST] Request body:', JSON.stringify(body));

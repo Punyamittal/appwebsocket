@@ -1,4 +1,4 @@
-# Restart Engage Server with REST API endpoints
+the auth is working finew for me the thing tyhat is not working is matching    ` Restart Engage Server with REST API endpoints
 
 Write-Host ""
 Write-Host "🔄 Restarting Engage Server..." -ForegroundColor Cyan

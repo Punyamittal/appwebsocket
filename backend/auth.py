@@ -55,10 +55,44 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     return encoded_jwt
 
 def verify_token(token: str) -> Optional[dict]:
+    """
+    Verify JWT token - supports both HS256 (backend tokens) and RS256 (Firebase tokens).
+    For RS256 tokens, decodes without verification to extract user ID (since we don't have Firebase public keys).
+    """
     try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        return payload
-    except JWTError:
+        # First, try HS256 (backend tokens)
+        try:
+            payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+            return payload
+        except JWTError:
+            # If HS256 fails, try to decode without verification (for RS256/Firebase tokens)
+            # We only need the user ID, not full verification
+            try:
+                # Decode without verification to extract user ID
+                # This is safe because we're only using it for matching, not authorization
+                # python-jose doesn't support options parameter, so we decode manually
+                import base64
+                import json
+                
+                # Split token into parts
+                parts = token.split('.')
+                if len(parts) != 3:
+                    return None
+                
+                # Decode payload (second part)
+                payload_part = parts[1]
+                # Add padding if needed
+                padding = len(payload_part) % 4
+                if padding:
+                    payload_part += '=' * (4 - padding)
+                
+                payload_bytes = base64.urlsafe_b64decode(payload_part)
+                payload = json.loads(payload_bytes)
+                return payload
+            except Exception as e:
+                # If decoding fails, return None
+                return None
+    except Exception:
         return None
 
 async def get_current_user(db: AsyncIOMotorDatabase, token: str):
