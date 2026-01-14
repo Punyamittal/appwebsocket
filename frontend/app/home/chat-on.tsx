@@ -25,7 +25,8 @@ import { ChatMessage } from '../../types';
 import { useAuthStore } from '../../store/authStore';
 import TopNavigation from '../../components/TopNavigation';
 // Skip On Service (REST + Firebase, no Socket.IO)
-import skipOnService, { ChatMessage as SkipOnMessage } from '../../services/skipOnService.new';
+import skipOnService from '../../services/skipOnService.new';
+import type { ChatMessageData as SkipOnMessage } from '../../services/skipOnService.new';
 import skipOnRESTService from '../../services/skipOnRESTService';
 import skipOnVideoCallService from '../../services/skipOnVideoCallService';
 import VideoCallView from '../../components/VideoCallView';
@@ -109,6 +110,26 @@ export default function ChatOnScreen() {
       const userId = await getUserId();
       
       console.log('[ChatOn] Starting chat for user:', userId);
+      
+      // Initialize video call service
+      skipOnVideoCallService.connect(userId);
+      skipOnVideoCallService.setCallbacks({
+        onIncomingCall: (callerId: string, roomId: string) => {
+          console.log('[ChatOn] 📞 Incoming video call from:', callerId);
+          setIncomingCallerId(callerId);
+          setIsIncomingCall(true);
+        },
+        onCallEnded: () => {
+          console.log('[ChatOn] 📴 Video call ended');
+          setIsVideoCallActive(false);
+          setLocalStream(null);
+          setRemoteStream(null);
+        },
+        onError: (error: string) => {
+          console.error('[ChatOn] 📹 Video call error:', error);
+          Alert.alert('Video Call Error', error);
+        }
+      });
       
       // Set searching state IMMEDIATELY (before API call) so UI shows searching
       // This ensures both users see "searching" even if one gets matched quickly
@@ -295,13 +316,13 @@ export default function ChatOnScreen() {
    * Start video call
    */
   const handleStartVideoCall = async () => {
-    if (!roomId || !partnerId || !user) {
+    if (!roomId || !partnerId) {
       Alert.alert('Error', 'Cannot start video call');
       return;
     }
 
     try {
-      const userId = user.id || user.guest_uuid || '';
+      const userId = await getUserId();
       await skipOnVideoCallService.initiateCall(roomId, userId, partnerId);
       const localStream = skipOnVideoCallService.getLocalStream();
       setLocalStream(localStream);
@@ -316,11 +337,11 @@ export default function ChatOnScreen() {
    * Answer incoming call
    */
   const handleAnswerCall = async (accepted: boolean) => {
-    if (!roomId || !incomingCallerId || !user) {
+    if (!roomId || !incomingCallerId) {
       return;
     }
 
-    const userId = user.id || user.guest_uuid || '';
+    const userId = await getUserId();
     await skipOnVideoCallService.answerCall(roomId, userId, accepted);
     
     if (accepted) {
@@ -336,9 +357,9 @@ export default function ChatOnScreen() {
   /**
    * End video call
    */
-  const handleEndVideoCall = () => {
-    if (roomId && user) {
-      const userId = user.id || user.guest_uuid || '';
+  const handleEndVideoCall = async () => {
+    if (roomId) {
+      const userId = await getUserId();
       skipOnVideoCallService.endCall(roomId, userId);
     }
     setIsVideoCallActive(false);
@@ -438,7 +459,7 @@ export default function ChatOnScreen() {
             <TouchableOpacity
               style={styles.startButton}
               onPress={handleStartChat}
-              disabled={chatState === 'searching'}
+              disabled={chatState === 'searching' || chatState === 'chatting'}
             >
               <Text style={styles.startButtonText}>
                 {chatState === 'error' ? 'Try Again' : 'Start Chat'}
@@ -459,7 +480,7 @@ export default function ChatOnScreen() {
           <View style={styles.searchingContainer}>
             <ActivityIndicator size="large" color="#4A90E2" />
             <Text style={styles.searchingText}>Connecting...</Text>
-            <Text style={styles.searchingSubtext}>Finding someone to chat with</Text>
+            <Text style={styles.searchingText}>Finding someone to chat with</Text>
             <Text style={styles.searchingHint}>
               💡 Tip: Open another browser tab or window to test matching!
             </Text>

@@ -21,17 +21,18 @@ export interface ChatMessageData {
   created_at: string;
 }
 
-// Get backend URL for Socket.IO
-const getBackendUrl = (): string => {
-  const expoExtraValue = Constants.expoConfig?.extra?.['EXPO_PUBLIC_BACKEND_URL'];
+// Get backend URL for Socket.IO (separate from REST API)
+const getSocketIoUrl = (): string => {
+  const expoExtraValue = Constants.expoConfig?.extra?.['EXPO_PUBLIC_SOCKETIO_URL'];
   if (expoExtraValue && typeof expoExtraValue === 'string' && expoExtraValue.trim() !== '') {
     return expoExtraValue.trim();
   }
-  const envValue = process.env.EXPO_PUBLIC_BACKEND_URL;
+  const envValue = process.env.EXPO_PUBLIC_SOCKETIO_URL;
   if (envValue && typeof envValue === 'string' && envValue.trim() !== '') {
     return envValue.trim();
   }
-  return 'http://localhost:3001';
+  // Default to port 3003 where Socket.IO is actually running
+  return 'http://localhost:3003';
 };
 
 class SkipOnService {
@@ -43,13 +44,13 @@ class SkipOnService {
   private onRoomReadyCallback: (() => void) | null = null;
   private socket: Socket | null = null;
   private isSearching: boolean = false;
-  private matchPollingInterval: NodeJS.Timeout | null = null;
+  private matchPollingInterval: ReturnType<typeof setInterval> | null = null;
   private backendUrl: string;
 
   constructor() {
-    this.backendUrl = getBackendUrl();
+    this.backendUrl = getSocketIoUrl();
     console.log('[SkipOn] Service initialized with Socket.IO messaging');
-    console.log('[SkipOn] Backend URL:', this.backendUrl);
+    console.log('[SkipOn] Socket.IO URL:', this.backendUrl);
   }
 
   /**
@@ -185,7 +186,7 @@ class SkipOnService {
       this.onMatchFoundCallback = onMatched;
       this.onMessageCallback = onMessage;
       this.onRoomEndedCallback = onPartnerLeft;
-      this.onRoomReadyCallback = onRoomReady;
+      this.onRoomReadyCallback = onRoomReady || null;
 
       console.log('[SkipOn] Starting matchmaking for user:', clientId);
       console.log('[SkipOn] Callbacks set - onMatched:', typeof onMatched, 'onMessage:', typeof onMessage);
@@ -437,28 +438,7 @@ class SkipOnService {
         });
       }
       
-      // Join chat room via Socket.IO
-      console.log('[SkipOn] Joining Socket.IO chat room...');
-      console.log('[SkipOn] Room ID:', result.roomId);
-      console.log('[SkipOn] Current User ID:', this.currentUserId);
-      console.log('[SkipOn] Partner ID:', result.partnerId);
-      
-      // Wait a moment for socket to fully connect
-      await new Promise(resolve => setTimeout(resolve, 500));
-      
-      if (!this.socket?.connected) {
-        console.error('[SkipOn] ❌ Socket not connected, cannot join room');
-        throw new Error('Socket.IO connection failed');
-      }
-      
-      this.socket.emit('skipon_join_chat_room', {
-        roomId: result.roomId,
-        userId: this.currentUserId,
-      });
-      
-      console.log('[SkipOn] ✅ Socket.IO chat room join request sent');
-      
-      // Wait for room join confirmation with timeout
+      // Set up event listeners BEFORE emitting join event
       let roomJoined = false;
       await new Promise<void>((resolve, reject) => {
         if (!this.socket) {
@@ -477,6 +457,7 @@ class SkipOnService {
           if (data.roomId === result.roomId) {
             clearTimeout(timeout);
             this.socket?.off('skipon_room_joined', onRoomJoined);
+            this.socket?.off('skipon_error', onError);
             console.log('[SkipOn] ✅ Room join confirmed via event');
             roomJoined = true;
             resolve();
@@ -487,17 +468,36 @@ class SkipOnService {
           console.error('[SkipOn] ❌ Room join error:', error.message);
           // Don't reject - try to proceed anyway
           clearTimeout(timeout);
+          this.socket?.off('skipon_room_joined', onRoomJoined);
+          this.socket?.off('skipon_error', onError);
           resolve();
         };
         
+        // Set up listeners FIRST
         this.socket.on('skipon_room_joined', onRoomJoined);
         this.socket.on('skipon_error', onError);
+        
+        // THEN emit the join event
+        console.log('[SkipOn] Joining Socket.IO chat room...');
+        console.log('[SkipOn] Room ID:', result.roomId);
+        console.log('[SkipOn] Current User ID:', this.currentUserId);
+        console.log('[SkipOn] Partner ID:', result.partnerId);
+        
+        this.socket.emit('skipon_join_chat_room', {
+          roomId: result.roomId,
+          userId: this.currentUserId,
+        });
+        
+        console.log('[SkipOn] ✅ Socket.IO chat room join request sent');
         
         // Clean up listeners after timeout
         setTimeout(() => {
           this.socket?.off('skipon_room_joined', onRoomJoined);
           this.socket?.off('skipon_error', onError);
         }, 5000);
+        
+        // Wait a moment for socket to fully connect
+        // await new Promise(resolve => setTimeout(resolve, 500));
       });
       
       // Call room ready callback - always call it, even if room join confirmation timed out
