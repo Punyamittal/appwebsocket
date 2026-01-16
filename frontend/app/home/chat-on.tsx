@@ -329,7 +329,23 @@ export default function ChatOnScreen() {
       setIsVideoCallActive(true);
     } catch (error: any) {
       console.error('[ChatOn] Error starting video call:', error);
-      Alert.alert('Error', error.message || 'Failed to start video call');
+      
+      // Handle specific permission errors
+      if (error.message && error.message.includes('permission denied')) {
+        Alert.alert(
+          'Camera Permission Required',
+          'Please allow camera access in your browser settings to start video call.\n\nClick the camera icon 📷 in your browser\'s address bar and select "Allow".',
+          [{ text: 'OK' }]
+        );
+      } else if (error.message && error.message.includes('No camera')) {
+        Alert.alert(
+          'Camera Not Found',
+          'No camera device was detected. Please connect a camera and try again.',
+          [{ text: 'OK' }]
+        );
+      } else {
+        Alert.alert('Error', error.message || 'Failed to start video call');
+      }
     }
   };
 
@@ -341,17 +357,42 @@ export default function ChatOnScreen() {
       return;
     }
 
-    const userId = await getUserId();
-    await skipOnVideoCallService.answerCall(roomId, userId, accepted);
-    
-    if (accepted) {
-      const localStream = skipOnVideoCallService.getLocalStream();
-      setLocalStream(localStream);
-      setIsVideoCallActive(true);
+    try {
+      const userId = await getUserId();
+      await skipOnVideoCallService.answerCall(roomId, userId, accepted);
+      
+      if (accepted) {
+        const localStream = skipOnVideoCallService.getLocalStream();
+        setLocalStream(localStream);
+        setIsVideoCallActive(true);
+      }
+      
+      setIsIncomingCall(false);
+      setIncomingCallerId(null);
+    } catch (error: any) {
+      console.error('[ChatOn] Error answering call:', error);
+      
+      // Handle specific permission errors
+      if (error.message && error.message.includes('permission denied')) {
+        Alert.alert(
+          'Camera Permission Required',
+          'Please allow camera access in your browser settings to answer video call.\n\nClick the camera icon 📷 in your browser\'s address bar and select "Allow".',
+          [{ text: 'OK' }]
+        );
+      } else if (error.message && error.message.includes('No camera')) {
+        Alert.alert(
+          'Camera Not Found',
+          'No camera device was detected. Please connect a camera and try again.',
+          [{ text: 'OK' }]
+        );
+      } else {
+        Alert.alert('Error', error.message || 'Failed to answer video call');
+      }
+      
+      // Reset incoming call state
+      setIsIncomingCall(false);
+      setIncomingCallerId(null);
     }
-    
-    setIsIncomingCall(false);
-    setIncomingCallerId(null);
   };
 
   /**

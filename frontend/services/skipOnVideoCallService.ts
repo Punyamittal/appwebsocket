@@ -149,6 +149,7 @@ class SkipOnVideoCallService {
 
     // Get local media stream
     try {
+      // Request media with proper user gesture handling
       this.localStream = await navigator.mediaDevices.getUserMedia({
         video: true,
         audio: true,
@@ -156,7 +157,17 @@ class SkipOnVideoCallService {
       console.log('[VideoCall] ✅ Local stream obtained');
     } catch (error: any) {
       console.error('[VideoCall] ❌ Failed to get local stream:', error);
-      throw new Error('Failed to access camera/microphone');
+      
+      // Handle different error types
+      if (error.name === 'NotAllowedError') {
+        throw new Error('Camera/Microphone permission denied. Please allow camera access in browser settings.');
+      } else if (error.name === 'NotFoundError') {
+        throw new Error('No camera/microphone found. Please connect a camera device.');
+      } else if (error.name === 'NotReadableError') {
+        throw new Error('Camera is already in use by another application.');
+      } else {
+        throw new Error(`Failed to access camera/microphone: ${error.message || 'Unknown error'}`);
+      }
     }
 
     // Create peer connection
@@ -208,6 +219,7 @@ class SkipOnVideoCallService {
 
       // Get local media stream
       try {
+        // Request media with proper user gesture handling
         this.localStream = await navigator.mediaDevices.getUserMedia({
           video: true,
           audio: true,
@@ -215,7 +227,17 @@ class SkipOnVideoCallService {
         console.log('[VideoCall] ✅ Local stream obtained');
       } catch (error: any) {
         console.error('[VideoCall] ❌ Failed to get local stream:', error);
-        throw new Error('Failed to access camera/microphone');
+        
+        // Handle different error types
+        if (error.name === 'NotAllowedError') {
+          throw new Error('Camera/Microphone permission denied. Please allow camera access in browser settings.');
+        } else if (error.name === 'NotFoundError') {
+          throw new Error('No camera/microphone found. Please connect a camera device.');
+        } else if (error.name === 'NotReadableError') {
+          throw new Error('Camera is already in use by another application.');
+        } else {
+          throw new Error(`Failed to access camera/microphone: ${error.message || 'Unknown error'}`);
+        }
       }
 
       // Create peer connection

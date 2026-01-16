@@ -17,6 +17,8 @@
     "start:no-redis": "node socket-server-no-redis.js",
     "start:old": "node socketio-skip-on-server.js",
     "dev": "nodemon socket-server.js",
+    "dev:ip": "python -m uvicorn server:socket_app --host 172.20.139.243 --port 3001 --reload",
+    "dev:ip:engage": "cd .. && npm run start:engage",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [

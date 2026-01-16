@@ -441,9 +441,9 @@ class SkipOnService {
       // Set up event listeners BEFORE emitting join event
       let roomJoined = false;
       await new Promise<void>((resolve, reject) => {
-        if (!this.socket) {
-          console.warn('[SkipOn] ⚠️ Socket not initialized, calling callback anyway');
-          resolve();
+        if (!this.socket || !this.socket.connected) {
+          console.error('[SkipOn] ❌ Socket not connected for room join');
+          reject(new Error('Socket.IO not connected'));
           return;
         }
         
@@ -451,7 +451,7 @@ class SkipOnService {
           console.warn('[SkipOn] ⚠️ Room join confirmation timeout - proceeding anyway');
           // Don't reject - allow messages to be sent even if confirmation is delayed
           resolve();
-        }, 3000); // Reduced to 3 seconds
+        }, 10000); // Increased to 10 seconds
         
         const onRoomJoined = (data: { roomId: string; partnerId: string }) => {
           if (data.roomId === result.roomId) {
@@ -532,7 +532,13 @@ class SkipOnService {
       throw new Error('Not in a room');
     }
 
-    if (!this.socket || !this.socket.connected) {
+    if (!this.socket) {
+      console.error('[SkipOn] ❌ Socket not initialized');
+      throw new Error('Socket.IO not initialized');
+    }
+
+    if (!this.socket.connected) {
+      console.error('[SkipOn] ❌ Socket.IO not connected');
       throw new Error('Socket.IO not connected');
     }
 
