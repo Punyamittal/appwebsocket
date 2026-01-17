@@ -1,0 +1,11 @@
+tunnels:
+  frontend:
+    proto: http
+    addr: 8081
+    bind_tls: true
+    subdomain: skipon-frontend
+  socketio:
+    proto: http  
+    addr: 3003
+    bind_tls: true
+    subdomain: skipon-socketio

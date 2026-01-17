@@ -70,6 +70,11 @@ class SkipOnService {
     }
 
     console.log(`[SkipOn] 🔌 Connecting to Socket.IO: ${this.backendUrl}`);
+    console.log('[SkipOn] 🔍 Current URL details:');
+    console.log(`  - Backend URL: ${this.backendUrl}`);
+    console.log(`  - User Agent: ${navigator.userAgent}`);
+    console.log(`  - Current URL: ${window.location.href}`);
+    
     this.socket = io(this.backendUrl, {
       transports: ['polling', 'websocket'], // Try polling first, then upgrade to websocket
       autoConnect: true,

@@ -51,6 +51,10 @@ const getAvatarImage = (avatarKey?: string) => {
 
 type ChatState = 'idle' | 'searching' | 'chatting' | 'error';
 
+const isChatStateActive = (state: ChatState): boolean => {
+  return state === 'searching' || state === 'chatting';
+};
+
 export default function ChatOnScreen() {
   const { user } = useAuthStore();
   const insets = useSafeAreaInsets();
@@ -343,6 +347,12 @@ export default function ChatOnScreen() {
           'No camera device was detected. Please connect a camera and try again.',
           [{ text: 'OK' }]
         );
+      } else if (error.message && error.message.includes('not supported')) {
+        Alert.alert(
+          'Browser Not Supported',
+          'Camera/Microphone is not supported in this browser. Please use a modern browser like Chrome, Firefox, or Safari.',
+          [{ text: 'OK' }]
+        );
       } else {
         Alert.alert('Error', error.message || 'Failed to start video call');
       }
@@ -383,6 +393,12 @@ export default function ChatOnScreen() {
         Alert.alert(
           'Camera Not Found',
           'No camera device was detected. Please connect a camera and try again.',
+          [{ text: 'OK' }]
+        );
+      } else if (error.message && error.message.includes('not supported')) {
+        Alert.alert(
+          'Browser Not Supported',
+          'Camera/Microphone is not supported in this browser. Please use a modern browser like Chrome, Firefox, or Safari.',
           [{ text: 'OK' }]
         );
       } else {
@@ -500,7 +516,7 @@ export default function ChatOnScreen() {
             <TouchableOpacity
               style={styles.startButton}
               onPress={handleStartChat}
-              disabled={chatState === 'searching' || chatState === 'chatting'}
+              disabled={isChatStateActive(chatState)}
             >
               <Text style={styles.startButtonText}>
                 {chatState === 'error' ? 'Try Again' : 'Start Chat'}

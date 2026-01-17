@@ -147,8 +147,20 @@ class SkipOnVideoCallService {
     // Join video call room
     this.socket.emit('skipon_video_call_join_room', { roomId });
 
+    // Reset any existing peer connection
+    if (this.peerConnection) {
+      console.log('[VideoCall] 🔄 Closing existing peer connection before creating new one');
+      this.peerConnection.close();
+      this.peerConnection = null;
+    }
+
     // Get local media stream
     try {
+      // Check if mediaDevices is available
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        throw new Error('Camera/Microphone not supported in this browser. Please use a modern browser like Chrome, Firefox, or Safari.');
+      }
+      
       // Request media with proper user gesture handling
       this.localStream = await navigator.mediaDevices.getUserMedia({
         video: true,
@@ -165,6 +177,8 @@ class SkipOnVideoCallService {
         throw new Error('No camera/microphone found. Please connect a camera device.');
       } else if (error.name === 'NotReadableError') {
         throw new Error('Camera is already in use by another application.');
+      } else if (error.message && error.message.includes('not supported')) {
+        throw new Error('Camera/Microphone not supported in this browser. Please use a modern browser like Chrome, Firefox, or Safari.');
       } else {
         throw new Error(`Failed to access camera/microphone: ${error.message || 'Unknown error'}`);
       }
@@ -188,9 +202,34 @@ class SkipOnVideoCallService {
     });
 
     // Create and send offer
+    // Reset any existing peer connection
     if (this.peerConnection) {
-      const offer = await this.peerConnection.createOffer();
-      await this.peerConnection.setLocalDescription(offer);
+      console.log('[VideoCall] 🔄 Closing existing peer connection before creating new one');
+      (this.peerConnection as RTCPeerConnection).close();
+      this.peerConnection = null;
+    }
+
+    // Create fresh peer connection
+    this.createPeerConnection();
+
+    // Add local stream to peer connection
+    if (this.localStream && this.peerConnection) {
+      console.log('[VideoCall] ➕ Adding local tracks to peer connection');
+      this.localStream.getTracks().forEach(track => {
+        console.log('[VideoCall] 🎤 Adding track:', track.kind, track.enabled);
+        this.peerConnection?.addTrack(track, this.localStream!);
+      });
+      
+      // Verify tracks were added
+      const senders = (this.peerConnection as RTCPeerConnection).getSenders();
+      console.log('[VideoCall] 📤 Total senders after adding tracks:', senders.length);
+    }
+
+    // Create and send offer
+    if (this.peerConnection) {
+      const offer = await (this.peerConnection as RTCPeerConnection).createOffer();
+      await (this.peerConnection as RTCPeerConnection).setLocalDescription(offer);
+      
       this.socket.emit('skipon_video_call_offer', {
         roomId,
         offer,
@@ -219,6 +258,11 @@ class SkipOnVideoCallService {
 
       // Get local media stream
       try {
+        // Check if mediaDevices is available
+        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+          throw new Error('Camera/Microphone not supported in this browser. Please use a modern browser like Chrome, Firefox, or Safari.');
+        }
+        
         // Request media with proper user gesture handling
         this.localStream = await navigator.mediaDevices.getUserMedia({
           video: true,
@@ -235,6 +279,8 @@ class SkipOnVideoCallService {
           throw new Error('No camera/microphone found. Please connect a camera device.');
         } else if (error.name === 'NotReadableError') {
           throw new Error('Camera is already in use by another application.');
+        } else if (error.message && error.message.includes('not supported')) {
+          throw new Error('Camera/Microphone not supported in this browser. Please use a modern browser like Chrome, Firefox, or Safari.');
         } else {
           throw new Error(`Failed to access camera/microphone: ${error.message || 'Unknown error'}`);
         }
@@ -280,15 +326,46 @@ class SkipOnVideoCallService {
 
     // Handle remote stream
     this.peerConnection.ontrack = (event) => {
-      console.log('[VideoCall] 📹 Remote stream received');
-      if (this.callbacks.onRemoteStream && event.streams[0]) {
-        this.callbacks.onRemoteStream(event.streams[0]);
+      console.log('[VideoCall] 🎥 REMOTE TRACK RECEIVED!', event.track?.kind);
+      console.log('[VideoCall] Remote streams:', event.streams?.length);
+      console.log('[VideoCall] Event details:', {
+        trackKind: event.track?.kind,
+        streamCount: event.streams?.length,
+        trackEnabled: event.track?.enabled,
+        trackId: event.track?.id
+      });
+      
+      // Handle both cases: event.streams[0] or create new stream
+      let remoteStream: MediaStream | null = null;
+      
+      if (event.streams && event.streams.length > 0) {
+        remoteStream = event.streams[0];
+        console.log('[VideoCall] ✅ Using stream from event.streams[0]');
+      } else if (event.track) {
+        // Create new stream if none provided
+        remoteStream = new MediaStream();
+        remoteStream.addTrack(event.track);
+        console.log('[VideoCall] ✅ Created new stream and added track');
+      }
+      
+      if (remoteStream) {
+        console.log('[VideoCall] 📹 Remote stream ready:', {
+          streamId: remoteStream.id,
+          tracks: remoteStream.getTracks().map(t => ({ kind: t.kind, enabled: t.enabled, id: t.id }))
+        });
+        
+        if (this.callbacks.onRemoteStream) {
+          this.callbacks.onRemoteStream(remoteStream);
+          console.log('[VideoCall] ✅ Remote stream callback triggered with stream:', remoteStream.id);
+        }
+      } else {
+        console.error('[VideoCall] ❌ No remote stream could be created');
       }
     };
 
     // Handle ICE candidates
     this.peerConnection.onicecandidate = (event) => {
-      if (event.candidate && this.socket?.connected && this.currentRoomId) {
+      if (event.candidate && this.socket?.connected && this.currentRoomId && this.peerConnection) {
         this.socket.emit('skipon_video_call_ice_candidate', {
           roomId: this.currentRoomId,
           candidate: event.candidate,
@@ -312,23 +389,52 @@ class SkipOnVideoCallService {
    * Handle WebRTC offer
    */
   private async handleOffer(offer: RTCSessionDescriptionInit, roomId: string): Promise<void> {
-    if (!this.peerConnection) {
-      this.createPeerConnection();
+    // Reset any existing peer connection before handling new offer
+    if (this.peerConnection) {
+      console.log('[VideoCall] 🔄 Closing existing peer connection before handling new offer');
+      (this.peerConnection as RTCPeerConnection).close();
+      this.peerConnection = null;
     }
 
+    // Create fresh peer connection
+    this.createPeerConnection();
+
+    // Add local stream to peer connection
+    if (this.localStream && this.peerConnection) {
+      console.log('[VideoCall] ➕ Adding local tracks to peer connection (callee)');
+      this.localStream.getTracks().forEach(track => {
+        console.log('[VideoCall] 🎤 Adding track (callee):', track.kind, track.enabled);
+        this.peerConnection?.addTrack(track, this.localStream!);
+      });
+    }
+
+    // Handle the offer
     if (this.peerConnection) {
-      await this.peerConnection.setRemoteDescription(new RTCSessionDescription(offer));
-
-      // Create and send answer
-      const answer = await this.peerConnection.createAnswer();
-      await this.peerConnection.setLocalDescription(answer);
-
-      if (this.socket?.connected) {
-        this.socket.emit('skipon_video_call_answer_webrtc', {
-          roomId,
-          answer,
-          senderId: this.currentUserId,
-        });
+      console.log('[VideoCall] 📥 Setting remote description (offer)');
+      console.log('[VideoCall] Current signaling state:', (this.peerConnection as RTCPeerConnection).signalingState);
+      
+      try {
+        await (this.peerConnection as RTCPeerConnection).setRemoteDescription(new RTCSessionDescription(offer));
+        console.log('[VideoCall] ✅ Remote description (offer) set successfully');
+        
+        // Create and send answer
+        const answer = await (this.peerConnection as RTCPeerConnection).createAnswer();
+        await (this.peerConnection as RTCPeerConnection).setLocalDescription(answer);
+        
+        console.log('[VideoCall] 📤 Sending answer');
+        if (this.socket?.connected) {
+          this.socket.emit('skipon_video_call_answer_webrtc', {
+            roomId,
+            answer,
+            senderId: this.currentUserId,
+          });
+        }
+        
+        // Process any buffered ICE candidates
+        this.processBufferedIceCandidates();
+      } catch (error) {
+        console.error('[VideoCall] ❌ Error handling offer:', error);
+        // Don't throw - let the call continue
       }
     }
   }
@@ -338,7 +444,19 @@ class SkipOnVideoCallService {
    */
   private async handleAnswer(answer: RTCSessionDescriptionInit): Promise<void> {
     if (this.peerConnection) {
-      await this.peerConnection.setRemoteDescription(new RTCSessionDescription(answer));
+      console.log('[VideoCall] 📥 Setting remote description (answer)');
+      console.log('[VideoCall] Current signaling state:', (this.peerConnection as RTCPeerConnection).signalingState);
+      
+      try {
+        await (this.peerConnection as RTCPeerConnection).setRemoteDescription(new RTCSessionDescription(answer));
+        console.log('[VideoCall] ✅ Remote description (answer) set successfully');
+        
+        // Process any buffered ICE candidates
+        this.processBufferedIceCandidates();
+      } catch (error) {
+        console.error('[VideoCall] ❌ Error setting remote description (answer):', error);
+        // Don't throw - let the call continue
+      }
     }
   }
 
@@ -347,7 +465,54 @@ class SkipOnVideoCallService {
    */
   private async handleIceCandidate(candidate: RTCIceCandidateInit): Promise<void> {
     if (this.peerConnection) {
-      await this.peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
+      console.log('[VideoCall] 📥 Adding ICE candidate');
+      console.log('[VideoCall] Current signaling state:', (this.peerConnection as RTCPeerConnection).signalingState);
+      console.log('[VideoCall] Remote description set:', (this.peerConnection as RTCPeerConnection).remoteDescription !== null);
+      
+      try {
+        // Only add ICE candidate if remote description is set
+        if ((this.peerConnection as RTCPeerConnection).remoteDescription) {
+          await (this.peerConnection as RTCPeerConnection).addIceCandidate(new RTCIceCandidate(candidate));
+          console.log('[VideoCall] ✅ ICE candidate added successfully');
+        } else {
+          console.warn('[VideoCall] ⚠️ ICE candidate received but remote description not set yet, buffering...');
+          // Buffer the candidate for later
+          this.bufferIceCandidate(candidate);
+        }
+      } catch (error) {
+        console.error('[VideoCall] ❌ Error adding ICE candidate:', error);
+        // Don't throw - let the call continue
+      }
+    }
+  }
+
+  /**
+   * Buffer ICE candidates when remote description is not set
+   */
+  private iceCandidateBuffer: RTCIceCandidateInit[] = [];
+
+  private bufferIceCandidate(candidate: RTCIceCandidateInit): void {
+    this.iceCandidateBuffer.push(candidate);
+    console.log('[VideoCall] 📦 Buffered ICE candidate, total:', this.iceCandidateBuffer.length);
+  }
+
+  /**
+   * Process buffered ICE candidates
+   */
+  private processBufferedIceCandidates(): void {
+    if (this.iceCandidateBuffer.length > 0 && this.peerConnection?.remoteDescription) {
+      console.log('[VideoCall] 📤 Processing buffered ICE candidates:', this.iceCandidateBuffer.length);
+      
+      this.iceCandidateBuffer.forEach(async (candidate) => {
+        try {
+          await (this.peerConnection as RTCPeerConnection).addIceCandidate(new RTCIceCandidate(candidate));
+          console.log('[VideoCall] ✅ Buffered ICE candidate added');
+        } catch (error) {
+          console.error('[VideoCall] ❌ Error adding buffered ICE candidate:', error);
+        }
+      });
+      
+      this.iceCandidateBuffer = [];
     }
   }
 
