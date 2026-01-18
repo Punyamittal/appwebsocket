@@ -50,9 +50,10 @@ export default function EngageScreen() {
   ];
 
   // If guest user, redirect to welcome/login immediately
-  if (isGuest) {
-    return <Redirect href="/welcome" />;
-  }
+  // COMMENTED OUT: Allow guest users to access engage
+  // if (isGuest) {
+  //   return <Redirect href="/welcome" />;
+  // }
 
   return (
     <View style={styles.container}>
@@ -74,6 +75,18 @@ export default function EngageScreen() {
               Available between 9 PM - 12 AM only
             </Text>
           </View>
+          
+          {/* Start Chat Button - Similar to Skip On */}
+          {/* COMMENTED OUT: Allow guest users to start chat */}
+          {/* {!isGuest && ( */}
+          <TouchableOpacity
+            style={styles.startChatButton}
+            onPress={() => router.push('/home/engage-on' as any)}
+          >
+            <Ionicons name="chatbubbles" size={20} color="#FFFFFF" />
+            <Text style={styles.startChatButtonText}>Start Chat</Text>
+          </TouchableOpacity>
+          {/* )} */}
         </View>
 
         {/* Info Section for Guests - Moved to Top */}
@@ -98,7 +111,8 @@ export default function EngageScreen() {
         {/* Sub-features Cards */}
         <View style={styles.featuresContainer}>
           {subFeatures.map((feature) => {
-            const isLocked = isGuest;
+            // COMMENTED OUT: Allow guest users to access features
+            const isLocked = false; // isGuest;
             return (
               <TouchableOpacity
                 key={feature.id}
@@ -408,6 +422,34 @@ const styles = StyleSheet.create({
     }),
   },
   signInButtonText: {
+    color: '#FFFFFF',
+    fontSize: 16,
+    fontWeight: '600',
+    letterSpacing: 0.3,
+  },
+  startChatButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#E91E63',
+    paddingVertical: 14,
+    paddingHorizontal: 32,
+    borderRadius: 16,
+    marginTop: 20,
+    gap: 8,
+    ...Platform.select({
+      ios: {
+        shadowColor: '#E91E63',
+        shadowOffset: { width: 0, height: 4 },
+        shadowOpacity: 0.3,
+        shadowRadius: 8,
+      },
+      android: {
+        elevation: 4,
+      },
+    }),
+  },
+  startChatButtonText: {
     color: '#FFFFFF',
     fontSize: 16,
     fontWeight: '600',

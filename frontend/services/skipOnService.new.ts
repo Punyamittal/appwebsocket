@@ -169,6 +169,75 @@ class SkipOnService {
       }
     });
 
+    // Activity request received
+    this.socket.on('skipon_activity_request', (data: {
+      roomId: string;
+      activity: string;
+      requesterId: string;
+      requesterName?: string;
+      requestId: string;
+    }) => {
+      // Only process requests for current room
+      if (data.roomId !== this.currentRoomId) {
+        console.log('[SkipOn] ⚠️ Ignoring activity request for different room:', data.roomId);
+        return;
+      }
+
+      // Don't process own requests
+      if (data.requesterId === this.currentUserId) {
+        console.log('[SkipOn] ⚠️ Ignoring own activity request');
+        return;
+      }
+
+      console.log('[SkipOn] 🎮 Activity request received:', data.activity, 'from:', data.requesterId);
+
+      if (this.onActivityRequestCallback) {
+        this.onActivityRequestCallback(data);
+      }
+    });
+
+    // Activity request response received
+    this.socket.on('skipon_activity_response', (data: {
+      roomId: string;
+      requestId: string;
+      activity: string;
+      approved: boolean;
+      respondentId: string;
+    }) => {
+      // Only process responses for current room
+      if (data.roomId !== this.currentRoomId) {
+        console.log('[SkipOn] ⚠️ Ignoring activity response for different room:', data.roomId);
+        return;
+      }
+
+      console.log('[SkipOn] 🎮 Activity request response:', data.approved ? 'approved' : 'declined', 'for:', data.activity);
+
+      if (this.onActivityResponseCallback) {
+        this.onActivityResponseCallback(data);
+      }
+    });
+
+    // Activity room created - receive roomId from partner
+    this.socket.on('skipon_activity_room_created', (data: {
+      roomId: string;
+      activity: string;
+      activityRoomId: string;
+      activityRoomCode?: string;
+      partnerId: string;
+    }) => {
+      // Only process for current room
+      if (data.roomId !== this.currentRoomId) {
+        console.log('[SkipOn] ⚠️ Ignoring activity room creation for different room:', data.roomId);
+        return;
+      }
+
+      console.log('[SkipOn] 🎮 Activity room created by partner:', data.activity, 'Room ID:', data.activityRoomId);
+
+      if (this.onActivityRoomCreatedCallback) {
+        this.onActivityRoomCreatedCallback(data);
+      }
+    });
+
     // Error handler
     this.socket.on('skipon_error', (error: { message: string }) => {
       console.error('[SkipOn] ❌ Socket.IO error:', error.message);
@@ -661,6 +730,114 @@ class SkipOnService {
       searching: this.isSearching,
       roomId: this.currentRoomId,
     };
+  }
+
+  /**
+   * Set activity request callback
+   */
+  setActivityRequestCallback(callback: (data: ActivityRequestData) => void): void {
+    this.onActivityRequestCallback = callback;
+  }
+
+  /**
+   * Set activity response callback
+   */
+  setActivityResponseCallback(callback: (data: ActivityResponseData) => void): void {
+    this.onActivityResponseCallback = callback;
+  }
+
+  /**
+   * Set activity room created callback
+   */
+  setActivityRoomCreatedCallback(callback: (data: ActivityRoomCreatedData) => void): void {
+    this.onActivityRoomCreatedCallback = callback;
+  }
+
+  /**
+   * Send activity request to partner
+   */
+  async sendActivityRequest(activity: string, requesterName?: string): Promise<string> {
+    if (!this.currentRoomId || !this.currentUserId) {
+      throw new Error('Not in a room');
+    }
+
+    if (!this.socket || !this.socket.connected) {
+      throw new Error('Socket.IO not connected');
+    }
+
+    const requestId = `req_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+
+    try {
+      console.log('[SkipOn] 🎮 Sending activity request:', activity);
+      this.socket.emit('skipon_activity_request', {
+        roomId: this.currentRoomId,
+        activity,
+        requesterId: this.currentUserId,
+        requesterName,
+        requestId,
+      });
+      console.log('[SkipOn] ✅ Activity request sent');
+      return requestId;
+    } catch (error: any) {
+      console.error('[SkipOn] ❌ Error sending activity request:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Respond to activity request (approve/decline)
+   */
+  async respondToActivityRequest(requestId: string, activity: string, approved: boolean): Promise<void> {
+    if (!this.currentRoomId || !this.currentUserId) {
+      throw new Error('Not in a room');
+    }
+
+    if (!this.socket || !this.socket.connected) {
+      throw new Error('Socket.IO not connected');
+    }
+
+    try {
+      console.log('[SkipOn] 🎮 Responding to activity request:', approved ? 'approved' : 'declined');
+      this.socket.emit('skipon_activity_response', {
+        roomId: this.currentRoomId,
+        requestId,
+        activity,
+        approved,
+        respondentId: this.currentUserId,
+      });
+      console.log('[SkipOn] ✅ Activity response sent');
+    } catch (error: any) {
+      console.error('[SkipOn] ❌ Error sending activity response:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Share activity room ID with partner after creation
+   */
+  async shareActivityRoom(activity: string, activityRoomId: string, activityRoomCode?: string): Promise<void> {
+    if (!this.currentRoomId || !this.currentUserId) {
+      throw new Error('Not in a room');
+    }
+
+    if (!this.socket || !this.socket.connected) {
+      throw new Error('Socket.IO not connected');
+    }
+
+    try {
+      console.log('[SkipOn] 🎮 Sharing activity room ID:', activityRoomId, 'for activity:', activity);
+      this.socket.emit('skipon_activity_room_created', {
+        roomId: this.currentRoomId,
+        activity,
+        activityRoomId,
+        activityRoomCode,
+        partnerId: this.currentUserId,
+      });
+      console.log('[SkipOn] ✅ Activity room ID shared with partner');
+    } catch (error: any) {
+      console.error('[SkipOn] ❌ Error sharing activity room ID:', error);
+      throw error;
+    }
   }
 }
 

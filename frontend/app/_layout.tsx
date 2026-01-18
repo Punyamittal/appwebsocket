@@ -1,3 +1,6 @@
+// Import polyfills first (for Expo web - handles FontFaceObserver errors)
+import '../polyfills';
+
 import React from 'react';
 import { Stack } from 'expo-router';
 import AuthProvider from '../contexts/AuthProvider';

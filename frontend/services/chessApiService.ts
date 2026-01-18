@@ -116,9 +116,9 @@ class ChessApiService {
   }
 
   /**
-   * Join an existing chess room by code
+   * Join an existing chess room by roomId or roomCode
    */
-  async joinRoom(userId: string, roomCode: string): Promise<{
+  async joinRoom(userId: string, roomIdOrCode: string): Promise<{
     success: boolean;
     roomId?: string;
     roomCode?: string;
@@ -130,7 +130,19 @@ class ChessApiService {
     error?: string;
   }> {
     try {
-      console.log(`[ChessApiService] Joining room with code: ${roomCode}`);
+      // Check if it looks like a roomId (contains hyphens) or roomCode (short alphanumeric)
+      const isRoomId = roomIdOrCode.includes('-') && roomIdOrCode.length > 20;
+      const isRoomCode = !isRoomId && roomIdOrCode.length <= 10;
+      
+      console.log(`[ChessApiService] Joining room with ${isRoomId ? 'ID' : isRoomCode ? 'code' : 'ID/code'}: ${roomIdOrCode.substring(0, 20)}...`);
+      
+      const requestBody: any = { userId };
+      if (isRoomId) {
+        requestBody.roomId = roomIdOrCode.trim();
+      } else {
+        requestBody.roomCode = roomIdOrCode.trim();
+      }
+      
       const response = await this.request<{
         success: boolean;
         roomId?: string;
@@ -143,10 +155,7 @@ class ChessApiService {
         error?: string;
       }>('/api/chess/join', {
         method: 'POST',
-        body: JSON.stringify({
-          userId,
-          roomCode: roomCode.trim(),
-        }),
+        body: JSON.stringify(requestBody),
         headers: {
           'X-User-Id': userId,
         },

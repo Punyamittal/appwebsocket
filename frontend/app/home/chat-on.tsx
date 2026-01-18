@@ -123,11 +123,17 @@ export default function ChatOnScreen() {
           setIncomingCallerId(callerId);
           setIsIncomingCall(true);
         },
+        onRemoteStream: (stream: MediaStream) => {
+          console.log('[ChatOn] 📹 Remote stream received:', stream.id);
+          setRemoteStream(stream);
+        },
         onCallEnded: () => {
           console.log('[ChatOn] 📴 Video call ended');
           setIsVideoCallActive(false);
           setLocalStream(null);
           setRemoteStream(null);
+          // Clear all messages when video call ends
+          setMessages([]);
         },
         onError: (error: string) => {
           console.error('[ChatOn] 📹 Video call error:', error);
@@ -422,6 +428,8 @@ export default function ChatOnScreen() {
     setIsVideoCallActive(false);
     setLocalStream(null);
     setRemoteStream(null);
+    // Clear all messages when video call ends
+    setMessages([]);
   };
 
   /**
@@ -559,28 +567,74 @@ export default function ChatOnScreen() {
   // Chatting State
   return (
     <View style={styles.container}>
-      <TopNavigation />
-      <View style={styles.header}>
-        <View style={styles.statusDot} />
-        <Text style={styles.headerText}>
-          {partnerName || (partnerId ? `Chatting with ${partnerId.substring(0, 8)}...` : 'Chatting with someone')}
-        </Text>
-        {roomReady && (
-          <TouchableOpacity 
-            style={styles.videoCallButton} 
-            onPress={handleStartVideoCall}
-            disabled={isVideoCallActive}
+      {/* Hide header and chat UI when video call is active */}
+      {!isVideoCallActive && (
+        <>
+          <TopNavigation />
+          <View style={styles.header}>
+            <View style={styles.statusDot} />
+            <Text style={styles.headerText}>
+              {partnerName || (partnerId ? `Chatting with ${partnerId.substring(0, 8)}...` : 'Chatting with someone')}
+            </Text>
+            {roomReady && (
+              <TouchableOpacity 
+                style={styles.videoCallButton} 
+                onPress={handleStartVideoCall}
+                disabled={isVideoCallActive}
+              >
+                <Ionicons name="videocam" size={20} color="#FFFFFF" />
+              </TouchableOpacity>
+            )}
+            <TouchableOpacity style={styles.skipButton} onPress={handleSkip}>
+              <Ionicons name="play-skip-forward" size={18} color="#FFFFFF" />
+              <Text style={styles.skipButtonText}>Skip</Text>
+            </TouchableOpacity>
+          </View>
+
+          <KeyboardAvoidingView
+            behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+            style={styles.chatContainer}
+            keyboardVerticalOffset={Platform.OS === 'ios' ? insets.top + 60 : 0}
           >
-            <Ionicons name="videocam" size={20} color="#FFFFFF" />
-          </TouchableOpacity>
-        )}
-        <TouchableOpacity style={styles.skipButton} onPress={handleSkip}>
-          <Ionicons name="play-skip-forward" size={18} color="#FFFFFF" />
-          <Text style={styles.skipButtonText}>Skip</Text>
-        </TouchableOpacity>
-      </View>
-      
-      {/* Video Call View Overlay */}
+            <FlatList
+              ref={flatListRef}
+              data={messages}
+              keyExtractor={(item) => item.message_id}
+              renderItem={renderMessage}
+              contentContainerStyle={styles.messagesList}
+              onContentSizeChange={() => flatListRef.current?.scrollToEnd({ animated: true })}
+              showsVerticalScrollIndicator={false}
+            />
+
+            <View style={[styles.inputContainer, { paddingBottom: insets.bottom + 8 }]}>
+              {!roomReady && (
+                <View style={styles.waitingBanner}>
+                  <Text style={styles.waitingText}>Waiting for partner to join...</Text>
+                </View>
+              )}
+              <TextInput
+                style={[styles.input, !roomReady && styles.inputDisabled]}
+                placeholder={roomReady ? "Type a message..." : "Waiting for partner..."}
+                placeholderTextColor="rgba(255, 255, 255, 0.5)"
+                value={inputMessage}
+                onChangeText={setInputMessage}
+                multiline
+                maxLength={500}
+                editable={roomReady}
+              />
+              <TouchableOpacity
+                style={[styles.sendButton, (!roomReady || !inputMessage.trim()) && styles.sendButtonDisabled]}
+                onPress={handleSendMessage}
+                disabled={!roomReady || !inputMessage.trim()}
+              >
+                <Ionicons name="send" size={20} color="#FFFFFF" />
+              </TouchableOpacity>
+            </View>
+          </KeyboardAvoidingView>
+        </>
+      )}
+
+      {/* Video Call View - Full Screen Overlay */}
       {isVideoCallActive && (
         <VideoCallView
           localStream={localStream}
@@ -592,6 +646,11 @@ export default function ChatOnScreen() {
           onToggleVideo={handleToggleVideo}
           onToggleAudio={handleToggleAudio}
           partnerName={partnerName || undefined}
+          messages={messages}
+          inputMessage={inputMessage}
+          onInputChange={setInputMessage}
+          onSendMessage={handleSendMessage}
+          roomReady={roomReady}
         />
       )}
 
@@ -622,47 +681,6 @@ export default function ChatOnScreen() {
           </View>
         </View>
       )}
-
-      <KeyboardAvoidingView
-        behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
-        style={styles.chatContainer}
-        keyboardVerticalOffset={Platform.OS === 'ios' ? insets.top + 60 : 0}
-      >
-        <FlatList
-          ref={flatListRef}
-          data={messages}
-          keyExtractor={(item) => item.message_id}
-          renderItem={renderMessage}
-          contentContainerStyle={styles.messagesList}
-          onContentSizeChange={() => flatListRef.current?.scrollToEnd({ animated: true })}
-          showsVerticalScrollIndicator={false}
-        />
-
-        <View style={[styles.inputContainer, { paddingBottom: insets.bottom + 8 }]}>
-          {!roomReady && (
-            <View style={styles.waitingBanner}>
-              <Text style={styles.waitingText}>Waiting for partner to join...</Text>
-            </View>
-          )}
-          <TextInput
-            style={[styles.input, !roomReady && styles.inputDisabled]}
-            placeholder={roomReady ? "Type a message..." : "Waiting for partner..."}
-            placeholderTextColor="rgba(255, 255, 255, 0.5)"
-            value={inputMessage}
-            onChangeText={setInputMessage}
-            multiline
-            maxLength={500}
-            editable={roomReady}
-          />
-          <TouchableOpacity
-            style={[styles.sendButton, (!roomReady || !inputMessage.trim()) && styles.sendButtonDisabled]}
-            onPress={handleSendMessage}
-            disabled={!roomReady || !inputMessage.trim()}
-          >
-            <Ionicons name="send" size={20} color="#FFFFFF" />
-          </TouchableOpacity>
-        </View>
-      </KeyboardAvoidingView>
     </View>
   );
 }

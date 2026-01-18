@@ -1566,6 +1566,81 @@ async def skipon_leave_chat_room(sid, data):
         
         logger.info(f"💬 SkipOn Chat: User {user_id} left chat room {room_id}")
 
+# ======================
+# Activity Request/Response Events
+# ======================
+@sio.event
+async def skipon_activity_request(sid, data):
+    """Handle activity request - forward to partner"""
+    room_id = data.get('roomId')
+    activity = data.get('activity')
+    requester_id = data.get('requesterId')
+    requester_name = data.get('requesterName')
+    request_id = data.get('requestId')
+    
+    if not room_id or not activity or not requester_id or not request_id:
+        await sio.emit('skipon_error', {'message': 'Missing required fields'}, room=sid)
+        return
+    
+    # Forward activity request to partner in the same chat room
+    await sio.emit('skipon_activity_request', {
+        'roomId': room_id,
+        'activity': activity,
+        'requesterId': requester_id,
+        'requesterName': requester_name,
+        'requestId': request_id
+    }, room=f"skipon_chat_{room_id}", skip_sid=sid)
+    
+    logger.info(f"🎮 Activity request: {requester_id} -> partner in room {room_id} for {activity}")
+
+@sio.event
+async def skipon_activity_response(sid, data):
+    """Handle activity response (approve/decline) - forward back to requester"""
+    room_id = data.get('roomId')
+    request_id = data.get('requestId')
+    activity = data.get('activity')
+    approved = data.get('approved', False)
+    respondent_id = data.get('respondentId')
+    
+    if not room_id or not request_id or not activity or respondent_id is None:
+        await sio.emit('skipon_error', {'message': 'Missing required fields'}, room=sid)
+        return
+    
+    # Forward response back to requester
+    await sio.emit('skipon_activity_response', {
+        'roomId': room_id,
+        'requestId': request_id,
+        'activity': activity,
+        'approved': approved,
+        'respondentId': respondent_id
+    }, room=f"skipon_chat_{room_id}", skip_sid=sid)
+    
+    logger.info(f"🎮 Activity response: {respondent_id} {'approved' if approved else 'declined'} {activity} request in room {room_id}")
+
+@sio.event
+async def skipon_activity_room_created(sid, data):
+    """Handle activity room creation - share roomId with partner"""
+    room_id = data.get('roomId')
+    activity = data.get('activity')
+    activity_room_id = data.get('activityRoomId')
+    activity_room_code = data.get('activityRoomCode')
+    partner_id = data.get('partnerId')
+    
+    if not room_id or not activity or not activity_room_id or not partner_id:
+        await sio.emit('skipon_error', {'message': 'Missing required fields'}, room=sid)
+        return
+    
+    # Forward activity room ID to partner
+    await sio.emit('skipon_activity_room_created', {
+        'roomId': room_id,
+        'activity': activity,
+        'activityRoomId': activity_room_id,
+        'activityRoomCode': activity_room_code,
+        'partnerId': partner_id
+    }, room=f"skipon_chat_{room_id}", skip_sid=sid)
+    
+    logger.info(f"🎮 Activity room shared: {partner_id} created {activity} room {activity_room_id} in chat room {room_id}")
+
 # Include router AFTER all routes are defined
 # This ensures all routes are registered before including the router
 app.include_router(api_router)

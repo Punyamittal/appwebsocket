@@ -52,5 +52,72 @@ if (typeof window !== 'undefined') {
       console.log('[Polyfill] ✅ Process fallback loaded');
     }
   }
+
+  // Suppress FontFaceObserver timeout errors
+  // These errors are non-critical - fonts will still work, detection just fails
+  const originalErrorHandler = window.onerror;
+  window.onerror = function(message, source, lineno, colno, error) {
+    // Suppress FontFaceObserver timeout errors
+    const messageStr = String(message || '');
+    const errorMessage = error?.message || '';
+    
+    if (
+      messageStr.includes('timeout exceeded') || 
+      messageStr.includes('FontFaceObserver') ||
+      errorMessage.includes('timeout exceeded') ||
+      errorMessage.includes('FontFaceObserver')
+    ) {
+      console.warn('[Polyfill] Suppressed FontFaceObserver timeout (non-critical)');
+      return true; // Suppress the error
+    }
+    
+    // Call original error handler for other errors
+    if (originalErrorHandler) {
+      return originalErrorHandler.call(this, message, source, lineno, colno, error);
+    }
+    return false;
+  };
+
+  // Also handle unhandled promise rejections
+  window.addEventListener('unhandledrejection', function(event) {
+    const reason = event.reason;
+    const errorMessage = 
+      (reason && typeof reason === 'object' && reason.message) ||
+      (typeof reason === 'string' ? reason : '');
+    
+    if (
+      errorMessage &&
+      (errorMessage.includes('timeout exceeded') || 
+       errorMessage.includes('FontFaceObserver'))
+    ) {
+      console.warn('[Polyfill] Suppressed FontFaceObserver promise rejection (non-critical)');
+      event.preventDefault(); // Suppress the error
+    }
+  });
+
+  // Patch setTimeout to catch errors from FontFaceObserver callbacks
+  const originalSetTimeout = window.setTimeout;
+  window.setTimeout = function(callback: Function, delay?: number, ...args: any[]) {
+    return originalSetTimeout.call(
+      this,
+      function() {
+        try {
+          callback.apply(this, args);
+        } catch (error: any) {
+          const errorMessage = error?.message || String(error || '');
+          if (
+            errorMessage.includes('timeout exceeded') ||
+            errorMessage.includes('FontFaceObserver')
+          ) {
+            console.warn('[Polyfill] Suppressed FontFaceObserver timeout in setTimeout (non-critical)');
+            return; // Suppress the error
+          }
+          throw error; // Re-throw other errors
+        }
+      },
+      delay,
+      ...args
+    );
+  };
 }
 

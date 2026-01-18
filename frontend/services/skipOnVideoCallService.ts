@@ -201,31 +201,7 @@ class SkipOnVideoCallService {
       calleeId,
     });
 
-    // Create and send offer
-    // Reset any existing peer connection
-    if (this.peerConnection) {
-      console.log('[VideoCall] 🔄 Closing existing peer connection before creating new one');
-      (this.peerConnection as RTCPeerConnection).close();
-      this.peerConnection = null;
-    }
-
-    // Create fresh peer connection
-    this.createPeerConnection();
-
-    // Add local stream to peer connection
-    if (this.localStream && this.peerConnection) {
-      console.log('[VideoCall] ➕ Adding local tracks to peer connection');
-      this.localStream.getTracks().forEach(track => {
-        console.log('[VideoCall] 🎤 Adding track:', track.kind, track.enabled);
-        this.peerConnection?.addTrack(track, this.localStream!);
-      });
-      
-      // Verify tracks were added
-      const senders = (this.peerConnection as RTCPeerConnection).getSenders();
-      console.log('[VideoCall] 📤 Total senders after adding tracks:', senders.length);
-    }
-
-    // Create and send offer
+    // Create and send offer (peer connection already created above)
     if (this.peerConnection) {
       const offer = await (this.peerConnection as RTCPeerConnection).createOffer();
       await (this.peerConnection as RTCPeerConnection).setLocalDescription(offer);
@@ -286,17 +262,37 @@ class SkipOnVideoCallService {
         }
       }
 
-      // Create peer connection
-      this.createPeerConnection();
-
-      // Add local stream
-      if (this.localStream && this.peerConnection) {
-        this.localStream.getTracks().forEach(track => {
-          this.peerConnection?.addTrack(track, this.localStream!);
-        });
+      // Check if peer connection already exists (created by handleOffer)
+      // If it exists, just add local stream to it instead of recreating
+      if (!this.peerConnection) {
+        console.log('[VideoCall] No existing peer connection, creating new one');
+        // Create peer connection only if it doesn't exist
+        this.createPeerConnection();
+      } else {
+        console.log('[VideoCall] ✅ Reusing existing peer connection (from handleOffer)');
       }
 
-      // Join room
+      // Add local stream to peer connection
+      if (this.localStream && this.peerConnection) {
+        // Check if tracks are already added
+        const existingSenders = this.peerConnection.getSenders();
+        const hasLocalTracks = existingSenders.some(sender => {
+          const track = sender.track;
+          return track && this.localStream?.getTracks().includes(track);
+        });
+
+        if (!hasLocalTracks) {
+          console.log('[VideoCall] ➕ Adding local tracks to existing peer connection');
+          this.localStream.getTracks().forEach(track => {
+            this.peerConnection?.addTrack(track, this.localStream!);
+            console.log('[VideoCall] 🎤 Added track:', track.kind, track.enabled);
+          });
+        } else {
+          console.log('[VideoCall] ✅ Local tracks already added to peer connection');
+        }
+      }
+
+      // Join room (if not already joined)
       this.socket.emit('skipon_video_call_join_room', { roomId });
     }
   }
@@ -315,6 +311,17 @@ class SkipOnVideoCallService {
    * Create WebRTC peer connection
    */
   private createPeerConnection(): void {
+    // Close existing peer connection if any
+    if (this.peerConnection) {
+      console.warn('[VideoCall] ⚠️ Creating new peer connection while one already exists. Closing old one.');
+      try {
+        this.peerConnection.close();
+      } catch (e) {
+        console.warn('[VideoCall] Error closing existing peer connection:', e);
+      }
+      this.peerConnection = null;
+    }
+
     const configuration: RTCConfiguration = {
       iceServers: [
         { urls: 'stun:stun.l.google.com:19302' },
@@ -322,6 +329,7 @@ class SkipOnVideoCallService {
       ],
     };
 
+    console.log('[VideoCall] 🔄 Creating new peer connection');
     this.peerConnection = new RTCPeerConnection(configuration);
 
     // Handle remote stream
@@ -376,12 +384,31 @@ class SkipOnVideoCallService {
 
     // Handle connection state changes
     this.peerConnection.onconnectionstatechange = () => {
-      console.log('[VideoCall] Connection state:', this.peerConnection?.connectionState);
-      if (this.peerConnection?.connectionState === 'failed') {
+      const state = this.peerConnection?.connectionState;
+      const signalingState = this.peerConnection?.signalingState;
+      console.log('[VideoCall] Connection state changed:', {
+        connectionState: state,
+        signalingState: signalingState,
+        remoteDescription: this.peerConnection?.remoteDescription?.type || 'none'
+      });
+      
+      if (state === 'connected') {
+        console.log('[VideoCall] ✅ Peer connection established!');
+      } else if (state === 'disconnected') {
+        console.log('[VideoCall] ⚠️ Peer connection disconnected');
+      } else if (state === 'failed') {
+        console.error('[VideoCall] ❌ Peer connection failed');
         if (this.callbacks.onError) {
           this.callbacks.onError('Connection failed');
         }
+      } else if (state === 'new') {
+        console.log('[VideoCall] ⚠️ Peer connection reset to new state');
       }
+    };
+    
+    // Also log ICE connection state
+    this.peerConnection.oniceconnectionstatechange = () => {
+      console.log('[VideoCall] ICE connection state:', this.peerConnection?.iceConnectionState);
     };
   }
 
@@ -443,19 +470,32 @@ class SkipOnVideoCallService {
    * Handle WebRTC answer
    */
   private async handleAnswer(answer: RTCSessionDescriptionInit): Promise<void> {
-    if (this.peerConnection) {
-      console.log('[VideoCall] 📥 Setting remote description (answer)');
-      console.log('[VideoCall] Current signaling state:', (this.peerConnection as RTCPeerConnection).signalingState);
+    if (!this.peerConnection) {
+      console.error('[VideoCall] ❌ Cannot set remote description: peer connection is null');
+      return;
+    }
+
+    console.log('[VideoCall] 📥 Setting remote description (answer)');
+    console.log('[VideoCall] Current signaling state:', (this.peerConnection as RTCPeerConnection).signalingState);
+    console.log('[VideoCall] Remote description before setting:', (this.peerConnection as RTCPeerConnection).remoteDescription?.type);
+    
+    try {
+      await (this.peerConnection as RTCPeerConnection).setRemoteDescription(new RTCSessionDescription(answer));
+      console.log('[VideoCall] ✅ Remote description (answer) set successfully');
+      console.log('[VideoCall] Remote description after setting:', (this.peerConnection as RTCPeerConnection).remoteDescription?.type);
+      console.log('[VideoCall] New signaling state:', (this.peerConnection as RTCPeerConnection).signalingState);
       
-      try {
-        await (this.peerConnection as RTCPeerConnection).setRemoteDescription(new RTCSessionDescription(answer));
-        console.log('[VideoCall] ✅ Remote description (answer) set successfully');
-        
-        // Process any buffered ICE candidates
-        this.processBufferedIceCandidates();
-      } catch (error) {
-        console.error('[VideoCall] ❌ Error setting remote description (answer):', error);
-        // Don't throw - let the call continue
+      // Process any buffered ICE candidates
+      this.processBufferedIceCandidates();
+    } catch (error: any) {
+      console.error('[VideoCall] ❌ Error setting remote description (answer):', error);
+      console.error('[VideoCall] Error details:', {
+        name: error?.name,
+        message: error?.message,
+        stack: error?.stack
+      });
+      if (this.callbacks.onError) {
+        this.callbacks.onError(`Failed to set remote description: ${error?.message || 'Unknown error'}`);
       }
     }
   }
@@ -499,20 +539,24 @@ class SkipOnVideoCallService {
   /**
    * Process buffered ICE candidates
    */
-  private processBufferedIceCandidates(): void {
+  private async processBufferedIceCandidates(): Promise<void> {
     if (this.iceCandidateBuffer.length > 0 && this.peerConnection?.remoteDescription) {
       console.log('[VideoCall] 📤 Processing buffered ICE candidates:', this.iceCandidateBuffer.length);
       
-      this.iceCandidateBuffer.forEach(async (candidate) => {
+      // Process all candidates sequentially to avoid race conditions
+      const candidates = [...this.iceCandidateBuffer];
+      this.iceCandidateBuffer = [];
+      
+      for (const candidate of candidates) {
         try {
-          await (this.peerConnection as RTCPeerConnection).addIceCandidate(new RTCIceCandidate(candidate));
-          console.log('[VideoCall] ✅ Buffered ICE candidate added');
+          if (this.peerConnection?.remoteDescription) {
+            await (this.peerConnection as RTCPeerConnection).addIceCandidate(new RTCIceCandidate(candidate));
+            console.log('[VideoCall] ✅ Buffered ICE candidate added');
+          }
         } catch (error) {
           console.error('[VideoCall] ❌ Error adding buffered ICE candidate:', error);
         }
-      });
-      
-      this.iceCandidateBuffer = [];
+      }
     }
   }
 
